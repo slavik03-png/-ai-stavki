@@ -1,8 +1,9 @@
+import asyncio
 import os
 import csv
 import tempfile
 from datetime import datetime, timezone
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -35,6 +36,21 @@ SPORTS = {
 REGIONS = "eu"
 MARKETS = "h2h,spreads,totals"
 ODDS_FORMAT = "decimal"
+
+CACHE_TTL_SECONDS = 30 * 60
+MIN_CREDITS_FOR_ALL = 30
+
+CACHE_LABELS = {
+    "football": "⚽ Футбол",
+    "tennis": "🎾 Теннис",
+    "hockey": "🏒 Хоккей",
+    "all": "🎯 Вся линия",
+}
+
+# cache[prefix] = {"csv_path": str, "message": str, "timestamp": float}
+cache: Dict[str, Dict[str, Any]] = {}
+cache_locks: Dict[str, asyncio.Lock] = {prefix: asyncio.Lock() for prefix in CACHE_LABELS}
+last_known_credits: Optional[int] = None
 
 
 def main_keyboard() -> InlineKeyboardMarkup:
@@ -109,6 +125,31 @@ def save_csv(rows: list[dict[str, Any]], prefix: str) -> str:
     return path
 
 
+def parse_credits(value: Optional[str]) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def cache_status_lines() -> str:
+    now = datetime.now(timezone.utc).timestamp()
+    lines = []
+    for prefix, label in CACHE_LABELS.items():
+        entry = cache.get(prefix)
+        if not entry:
+            lines.append(f"{label}: нет данных")
+            continue
+        remaining = CACHE_TTL_SECONDS - (now - entry["timestamp"])
+        if remaining <= 0:
+            cache.pop(prefix, None)
+            lines.append(f"{label}: нет данных")
+        else:
+            minutes = max(1, int(remaining // 60) + (1 if remaining % 60 else 0))
+            lines.append(f"{label}: есть (обновится через {minutes} мин)")
+    return "\n".join(lines)
+
+
 def summarize(rows: list[dict[str, Any]], credits_left: str) -> str:
     events = set()
     markets = set()
@@ -138,41 +179,100 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_keyboard())
 
 
+async def send_cached(query, prefix: str) -> None:
+    entry = cache[prefix]
+    await query.message.reply_text(
+        "🗄 Данные из кэша (не старше 30 минут), новый запрос к API не выполнялся.\n\n"
+        + entry["message"],
+        reply_markup=main_keyboard(),
+    )
+    with open(entry["csv_path"], "rb") as f:
+        await query.message.reply_document(document=f, filename=os.path.basename(entry["csv_path"]))
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global last_known_credits
     query = update.callback_query
     await query.answer()
 
     if query.data == "status":
         ok_bot = "✅" if TELEGRAM_BOT_TOKEN else "❌"
         ok_odds = "✅" if ODDS_API_KEY else "❌"
-        await query.message.reply_text(
-            f"ℹ️ Статус AI Ставки\n\nTelegram token: {ok_bot}\nThe Odds API key: {ok_odds}\n",
-            reply_markup=main_keyboard(),
+        credits_text = str(last_known_credits) if last_known_credits is not None else "неизвестно (ещё не было запросов)"
+        text = (
+            "ℹ️ Статус AI Ставки\n\n"
+            f"Telegram token: {ok_bot}\n"
+            f"The Odds API key: {ok_odds}\n"
+            f"Осталось кредитов API: {credits_text}\n\n"
+            "Кэш (хранится 30 минут):\n"
+            f"{cache_status_lines()}"
         )
+        await query.message.reply_text(text, reply_markup=main_keyboard())
         return
 
     if query.data and query.data.startswith("odds:"):
         kind = query.data.split(":", 1)[1]
         if kind == "all":
             sport_keys = SPORTS["football"] + SPORTS["tennis"] + SPORTS["hockey"]
-            prefix = "all"
         else:
             sport_keys = SPORTS.get(kind, [])
-            prefix = kind
+        prefix = kind
 
         if not ODDS_API_KEY:
             await query.message.reply_text("❌ Не найден ODDS_API_KEY в настройках Render.")
             return
 
-        await query.message.reply_text("⏳ Получаю линию... Подожди 10–30 секунд.")
-        try:
-            rows, credits_left = fetch_odds(sport_keys)
-            csv_path = save_csv(rows, prefix)
-            await query.message.reply_text(summarize(rows, credits_left), reply_markup=main_keyboard())
-            with open(csv_path, "rb") as f:
-                await query.message.reply_document(document=f, filename=os.path.basename(csv_path))
-        except Exception as e:
-            await query.message.reply_text(f"❌ Ошибка: {e}", reply_markup=main_keyboard())
+        now_ts = datetime.now(timezone.utc).timestamp()
+        entry = cache.get(prefix)
+        if entry and (now_ts - entry["timestamp"]) < CACHE_TTL_SECONDS:
+            await send_cached(query, prefix)
+            return
+
+        lock = cache_locks[prefix]
+        if lock.locked():
+            await query.message.reply_text(
+                f"⏳ Запрос для «{CACHE_LABELS[prefix]}» уже выполняется. "
+                "Подожди немного и нажми кнопку снова.",
+                reply_markup=main_keyboard(),
+            )
+            return
+
+        async with lock:
+            # Re-check cache in case it was filled while we were waiting for the lock.
+            now_ts = datetime.now(timezone.utc).timestamp()
+            entry = cache.get(prefix)
+            if entry and (now_ts - entry["timestamp"]) < CACHE_TTL_SECONDS:
+                await send_cached(query, prefix)
+                return
+
+            if prefix == "all" and last_known_credits is not None and last_known_credits < MIN_CREDITS_FOR_ALL:
+                await query.message.reply_text(
+                    "⚠️ Слишком мало кредитов The Odds API "
+                    f"(осталось: {last_known_credits}). Запрос всей линии отменён, "
+                    "чтобы не исчерпать лимит. Попробуй запросить один вид спорта "
+                    "или подожди обновления лимита.",
+                    reply_markup=main_keyboard(),
+                )
+                return
+
+            await query.message.reply_text("⏳ Получаю линию... Подожди 10–30 секунд.")
+            try:
+                rows, credits_left = await asyncio.to_thread(fetch_odds, sport_keys)
+                parsed_credits = parse_credits(credits_left)
+                if parsed_credits is not None:
+                    last_known_credits = parsed_credits
+                csv_path = save_csv(rows, prefix)
+                message = summarize(rows, credits_left)
+                cache[prefix] = {
+                    "csv_path": csv_path,
+                    "message": message,
+                    "timestamp": datetime.now(timezone.utc).timestamp(),
+                }
+                await query.message.reply_text(message, reply_markup=main_keyboard())
+                with open(csv_path, "rb") as f:
+                    await query.message.reply_document(document=f, filename=os.path.basename(csv_path))
+            except Exception as e:
+                await query.message.reply_text(f"❌ Ошибка: {e}", reply_markup=main_keyboard())
 
 
 def main() -> None:
