@@ -1,0 +1,108 @@
+"""
+Real Odds API access for the AI predictions feature.
+
+Deliberately separate from bot.fetch_odds(): that function flattens
+bookmaker/market/outcome rows for the CSV export buttons, discarding the
+structure (which bookmaker offered which full set of outcomes) that the
+selection engine needs for margin removal and multi-bookmaker consensus.
+This module keeps the raw event/bookmaker/market/outcome tree.
+
+Football-only in this first version (see ai_predictions/__init__.py for
+why). The sport-key list is intentionally duplicated from bot.py rather
+than imported from it, so this package never imports bot.py (see
+tests/test_ai_predictions_isolation.py).
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
+
+ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+REGIONS = "eu"
+ODDS_FORMAT = "decimal"
+
+#: Same football leagues bot.py's SPORTS["football"] tracks today.
+FOOTBALL_SPORT_KEYS = [
+    "soccer_epl",
+    "soccer_spain_la_liga",
+    "soccer_italy_serie_a",
+    "soccer_germany_bundesliga",
+    "soccer_france_ligue_one",
+    "soccer_uefa_champs_league",
+    "soccer_uefa_europa_league",
+]
+
+#: Requested in priority order; if the combined request is rejected by the
+#: account's plan, we retry with a smaller, near-universally-supported set
+#: rather than giving up on the whole league. Whatever markets are missing
+#: from the response are just absent from `event["bookmakers"][...]["markets"]`
+#: -- never invented.
+PREFERRED_MARKETS = "h2h,totals,btts,team_totals,draw_no_bet,double_chance"
+FALLBACK_MARKETS = "h2h,totals"
+
+
+def _get_odds_api_key() -> Optional[str]:
+    return os.getenv("ODDS_API_KEY")
+
+
+def _fetch_one_league(sport_key: str, api_key: str, markets: str) -> "Tuple[Optional[List[Dict[str, Any]]], Optional[str], Optional[str]]":
+    """Returns (events_or_None, credits_remaining_header_or_None, error_or_None)."""
+    url = f"{ODDS_API_BASE}/sports/{sport_key}/odds"
+    params = {
+        "apiKey": api_key,
+        "regions": REGIONS,
+        "markets": markets,
+        "oddsFormat": ODDS_FORMAT,
+        "dateFormat": "iso",
+    }
+    try:
+        response = requests.get(url, params=params, timeout=30)
+    except requests.RequestException as exc:
+        return None, None, f"Сетевая ошибка The Odds API ({sport_key}): {exc}"
+    credits = response.headers.get("x-requests-remaining")
+    if response.status_code != 200:
+        return None, credits, f"The Odds API вернул HTTP {response.status_code} для {sport_key}"
+    try:
+        events = response.json()
+    except ValueError:
+        return None, credits, f"The Odds API вернул некорректный JSON для {sport_key}"
+    return events, credits, None
+
+
+def fetch_football_events(
+    api_key: Optional[str] = None,
+    sport_keys: Optional[List[str]] = None,
+) -> "Tuple[List[Dict[str, Any]], Optional[str], List[str]]":
+    """Fetches raw event JSON (full bookmaker/market/outcome tree, not
+    flattened) for every football league. Returns
+    (events, credits_remaining, per_league_errors). A single league failing
+    never aborts the others -- its error is recorded and it is skipped."""
+    api_key = api_key or _get_odds_api_key()
+    sport_keys = sport_keys if sport_keys is not None else FOOTBALL_SPORT_KEYS
+
+    if not api_key:
+        return [], None, ["Не найден ODDS_API_KEY"]
+
+    all_events: List[Dict[str, Any]] = []
+    credits_remaining: Optional[str] = None
+    errors: List[str] = []
+
+    for sport_key in sport_keys:
+        events, credits, error = _fetch_one_league(sport_key, api_key, PREFERRED_MARKETS)
+        if error:
+            # Retry once with the minimal, widely-supported market set --
+            # some plans reject additional markets like team_totals/btts.
+            events, credits, error = _fetch_one_league(sport_key, api_key, FALLBACK_MARKETS)
+        if credits is not None:
+            credits_remaining = credits
+        if error:
+            errors.append(error)
+            continue
+        for event in events or []:
+            event["_sport_key"] = sport_key
+            all_events.append(event)
+
+    return all_events, credits_remaining, errors

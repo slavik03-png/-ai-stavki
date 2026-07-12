@@ -9,8 +9,18 @@ import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
+# Only the orchestration package is imported here -- never tracking/ or
+# selection_engine/ directly (see tests/test_selection_isolation.py and
+# tests/test_tracking_bot_isolation.py, which assert this boundary).
+from ai_predictions.pipeline import run_ai_predictions
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
+FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY")
+
+AI_PREDICTIONS_PREFIX = "ai_predictions"
+MIN_CREDITS_FOR_AI_PREDICTIONS = 10
+CACHE_LABELS_AI_PREDICTIONS = "🤖 Прогнозы ИИ"
 
 SPORTS = {
     "football": [
@@ -52,6 +62,11 @@ cache: Dict[str, Dict[str, Any]] = {}
 cache_locks: Dict[str, asyncio.Lock] = {prefix: asyncio.Lock() for prefix in CACHE_LABELS}
 last_known_credits: Optional[int] = None
 
+# ai_predictions_cache = {"message": str, "timestamp": float} -- separate
+# from the odds cache above (different prefix namespace, different lock).
+ai_predictions_cache: Optional[Dict[str, Any]] = None
+ai_predictions_lock = asyncio.Lock()
+
 
 def main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -61,6 +76,7 @@ def main_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🎾 Теннис", callback_data="odds:tennis"),
             InlineKeyboardButton("🏒 Хоккей", callback_data="odds:hockey"),
         ],
+        [InlineKeyboardButton("🤖 Прогнозы ИИ", callback_data=AI_PREDICTIONS_PREFIX)],
         [InlineKeyboardButton("ℹ️ Статус", callback_data="status")],
     ])
 
@@ -190,6 +206,69 @@ async def send_cached(query, prefix: str) -> None:
         await query.message.reply_document(document=f, filename=os.path.basename(entry["csv_path"]))
 
 
+async def handle_ai_predictions(query) -> None:
+    global ai_predictions_cache
+
+    if not ODDS_API_KEY or not FOOTBALL_API_KEY:
+        await query.message.reply_text(
+            "❌ Для прогнозов ИИ нужны оба ключа: ODDS_API_KEY и FOOTBALL_API_KEY.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    now_ts = datetime.now(timezone.utc).timestamp()
+    if ai_predictions_cache and (now_ts - ai_predictions_cache["timestamp"]) < CACHE_TTL_SECONDS:
+        await query.message.reply_text(
+            "🗄 Прогноз из кэша (не старше 30 минут), новый запрос не выполнялся.\n\n"
+            + ai_predictions_cache["message"],
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    if ai_predictions_lock.locked():
+        await query.message.reply_text(
+            "⏳ Прогноз уже формируется. Подожди немного и нажми кнопку снова.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    async with ai_predictions_lock:
+        now_ts = datetime.now(timezone.utc).timestamp()
+        if ai_predictions_cache and (now_ts - ai_predictions_cache["timestamp"]) < CACHE_TTL_SECONDS:
+            await query.message.reply_text(
+                "🗄 Прогноз из кэша (не старше 30 минут), новый запрос не выполнялся.\n\n"
+                + ai_predictions_cache["message"],
+                reply_markup=main_keyboard(),
+            )
+            return
+
+        if last_known_credits is not None and last_known_credits < MIN_CREDITS_FOR_AI_PREDICTIONS:
+            await query.message.reply_text(
+                "⚠️ Слишком мало кредитов The Odds API "
+                f"(осталось: {last_known_credits}). Запрос прогнозов ИИ отменён, "
+                "чтобы не исчерпать лимит.",
+                reply_markup=main_keyboard(),
+            )
+            return
+
+        await query.message.reply_text(
+            "🤖 Анализирую матчи ближайших 36 часов (реальные коэффициенты + статистика)... "
+            "Это может занять минуту."
+        )
+        try:
+            result = await asyncio.to_thread(run_ai_predictions)
+            ai_predictions_cache = {
+                "message": result.report_text,
+                "timestamp": datetime.now(timezone.utc).timestamp(),
+            }
+            await query.message.reply_text(result.report_text, reply_markup=main_keyboard())
+            if result.errors:
+                error_preview = "\n".join(result.errors[:5])
+                await query.message.reply_text(f"⚠️ Часть данных получить не удалось:\n{error_preview}")
+        except Exception as e:
+            await query.message.reply_text(f"❌ Ошибка при формировании прогнозов ИИ: {e}", reply_markup=main_keyboard())
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     global last_known_credits
     query = update.callback_query
@@ -198,16 +277,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if query.data == "status":
         ok_bot = "✅" if TELEGRAM_BOT_TOKEN else "❌"
         ok_odds = "✅" if ODDS_API_KEY else "❌"
+        ok_football = "✅" if FOOTBALL_API_KEY else "❌"
         credits_text = str(last_known_credits) if last_known_credits is not None else "неизвестно (ещё не было запросов)"
+        ai_predictions_status = "нет данных" if not ai_predictions_cache else "есть (обновится в течение 30 минут)"
         text = (
             "ℹ️ Статус AI Ставки\n\n"
             f"Telegram token: {ok_bot}\n"
             f"The Odds API key: {ok_odds}\n"
-            f"Осталось кредитов API: {credits_text}\n\n"
+            f"API-Football key: {ok_football}\n"
+            f"Осталось кредитов The Odds API: {credits_text}\n\n"
             "Кэш (хранится 30 минут):\n"
-            f"{cache_status_lines()}"
+            f"{cache_status_lines()}\n"
+            f"{CACHE_LABELS_AI_PREDICTIONS}: {ai_predictions_status}"
         )
         await query.message.reply_text(text, reply_markup=main_keyboard())
+        return
+
+    if query.data == AI_PREDICTIONS_PREFIX:
+        await handle_ai_predictions(query)
         return
 
     if query.data and query.data.startswith("odds:"):

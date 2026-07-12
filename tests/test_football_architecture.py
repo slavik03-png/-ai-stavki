@@ -8,8 +8,10 @@ prediction/recommendation/report logic built on top of it:
 - Stat.missing() never carries a value, and always carries a reason
 - Stat.ok() always carries a value
 - the mock provider implements the full abstract interface
-- the API-Football template makes no network calls and needs no secret,
-  yet still returns well-formed Stat.missing(...) results
+- ApiFootballProvider (activated for the AI predictions feature) makes
+  real network calls when a key is configured, but degrades safely to
+  Stat.missing(...) -- never a crash, never invented data -- when no key
+  is configured or the network/API fails
 """
 
 import inspect
@@ -47,15 +49,21 @@ def test_api_football_template_implements_full_interface():
     check("ApiFootballProvider template implements every abstract method", not missing, missing)
 
 
-def test_api_football_makes_no_network_calls_and_needs_no_secret():
-    import football.providers.api_football as mod
-    source = inspect.getsource(mod)
-    check("api_football.py does not import requests/httpx/urllib",
-          not any(tok in source for tok in ("import requests", "import httpx", "import urllib")))
+def test_api_football_degrades_safely_without_key():
     provider = ApiFootballProvider()  # must not require any secret/env var to construct
     stat = provider.get_last_matches("Any Team")
-    check("ApiFootballProvider returns Stat.missing without network access",
+    check("ApiFootballProvider without a key returns Stat.missing, never a crash",
           isinstance(stat, Stat) and not stat.available and bool(stat.reason))
+    stat2 = provider.get_standings("Any League")
+    check("ApiFootballProvider without a key returns Stat.missing for every method",
+          isinstance(stat2, Stat) and not stat2.available and bool(stat2.reason))
+
+
+def test_api_football_enforces_request_budget():
+    provider = ApiFootballProvider(api_key="fake-key-for-budget-test", max_requests_per_run=0)
+    stat = provider.get_last_matches("Any Team")
+    check("ApiFootballProvider with an exhausted budget returns Stat.missing without a network call",
+          isinstance(stat, Stat) and not stat.available and "лимит" in (stat.reason or "").lower())
 
 
 def test_stat_contract():
@@ -90,7 +98,8 @@ def test_all_mock_provider_methods_return_stat():
 def run():
     test_mock_provider_implements_full_interface()
     test_api_football_template_implements_full_interface()
-    test_api_football_makes_no_network_calls_and_needs_no_secret()
+    test_api_football_degrades_safely_without_key()
+    test_api_football_enforces_request_budget()
     test_stat_contract()
     test_all_mock_provider_methods_return_stat()
 
