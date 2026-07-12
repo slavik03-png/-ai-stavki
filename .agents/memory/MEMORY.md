@@ -1,0 +1,1 @@
+- [Confidence-blend missing-data trap](confidence-blend-missing-data.md) — dropping missing factors from a weighted average can raise confidence; blend them at neutral weight instead.
