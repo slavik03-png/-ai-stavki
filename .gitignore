@@ -7,3 +7,5 @@ attached_assets/
 *.zip
 *.log
 .pytest_cache/
+data/*.db
+data/*.sqlite3
