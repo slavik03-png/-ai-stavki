@@ -16,12 +16,11 @@ price on offer. When the best price is priced notably higher than what
 the rest of the market thinks is fair, that gap ("edge") is real, verified
 divergence between real bookmakers -- not a guess about the match itself.
 
-This deliberately does not reuse selection_engine's CandidatePrediction /
-SelectionConfig machinery: that engine's confidence scoring, sample
-reliability and historical-performance blending are built around having a
-separate statistics-based model_probability, which does not exist here.
-Reusing it would risk quietly presenting a "confidence score" that implies
-statistical modeling that never happened.
+Row extraction, validation, deduplication and grouping (turning a raw
+Odds API event into stable per-event/market/point/outcome groups with a
+real bookmaker count each) live in ai_predictions/matching.py -- this
+module only consumes MarketGroup objects and computes the value-detection
+math on top of them.
 """
 
 from __future__ import annotations
@@ -30,31 +29,39 @@ import datetime
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from ai_predictions.candidate_builder import (
-    _bookmaker_entries,
-    _distinct_totals_points,
-    _matches_double_chance,
-)
+from ai_predictions.matching import AWAY, DRAW, HOME, OVER, UNDER, MarketGroup
 from selection_engine.config import (
     MARKET_1X2,
     MARKET_DOUBLE_CHANCE,
     MARKET_DRAW_NO_BET,
+    MARKET_SPREAD,
     MARKET_TOTAL_GOALS,
 )
 from selection_engine.scoring import normalise_market_probabilities, raw_implied_probability
 
-#: The Odds API market key -> our internal market_type (kept identical to
+#: matching.py market key -> our internal market_type (kept identical to
 #: tracking.settlement's market types so every saved prediction can later
-#: be graded). "spreads" (Asian handicap) is intentionally excluded: the
-#: tracking/settlement package has no handicap-settlement function today,
-#: so a spreads recommendation could never be settled -- consistent with
-#: this codebase's rule of never producing a candidate for a market the
-#: tracking system cannot later grade.
+#: be graded).
 MARKET_KEY_TO_TYPE: Dict[str, str] = {
     "h2h": MARKET_1X2,
     "double_chance": MARKET_DOUBLE_CHANCE,
     "draw_no_bet": MARKET_DRAW_NO_BET,
     "totals": MARKET_TOTAL_GOALS,
+    "spreads": MARKET_SPREAD,
+}
+
+#: Human-readable selection label per market/canonical-outcome, used only
+#: for display (grouping/matching always uses the canonical label).
+_SELECTION_LABELS = {
+    "h2h": {HOME: "{home}", DRAW: "Ничья", AWAY: "{away}"},
+    "draw_no_bet": {HOME: "{home}", AWAY: "{away}"},
+    "spreads": {HOME: "{home}", AWAY: "{away}"},
+    "totals": {OVER: "Over", UNDER: "Under"},
+    "double_chance": {
+        "HOME_OR_DRAW": "{home} или ничья",
+        "DRAW_OR_AWAY": "ничья или {away}",
+        "HOME_OR_AWAY": "{home} или {away}",
+    },
 }
 
 #: A recommendation needs at least this many independent real bookmaker
@@ -118,71 +125,37 @@ def _margin_free_probability(price: float, complete_prices: List[float]) -> Opti
         raw_all = [raw_implied_probability(p) for p in complete_prices]
     except ValueError:
         return None
-    normalised = normalise_market_probabilities(raw_all)
+    total = sum(raw_all)
+    if total <= 0:
+        return None
     raw = raw_implied_probability(price)
-    return raw / sum(raw_all)
+    return raw / total
 
 
-def _selection_matchers(market_key: str, home_team: str, away_team: str):
-    """Returns (selection_label, outcome_matcher) pairs for markets that
-    have no line/point (h2h, double_chance, draw_no_bet)."""
-    if market_key == "h2h":
-        return [
-            (home_team, lambda name: name == home_team),
-            ("Ничья", lambda name: name.lower() in ("draw", "ничья")),
-            (away_team, lambda name: name == away_team),
-        ]
-    if market_key == "double_chance":
-        return [
-            (f"{home_team} или ничья", lambda name: _matches_double_chance(name, home_team, None)),
-            (f"ничья или {away_team}", lambda name: _matches_double_chance(name, None, away_team)),
-            (f"{home_team} или {away_team}", lambda name: _matches_double_chance(name, home_team, away_team)),
-        ]
-    if market_key == "draw_no_bet":
-        return [
-            (home_team, lambda name: name == home_team),
-            (away_team, lambda name: name == away_team),
-        ]
-    return []
+def _display_selection(market_key: str, canonical: str, home_team: str, away_team: str) -> str:
+    template = _SELECTION_LABELS.get(market_key, {}).get(canonical, canonical)
+    return template.format(home=home_team, away=away_team)
 
 
-def _build_for_selection(
-    *,
-    event: Dict[str, Any],
-    event_id: str,
-    league: Optional[str],
-    market_key: str,
-    market_type: str,
-    selection_name: str,
-    outcome_matcher,
-    home_team: str,
-    away_team: str,
-    match_datetime: str,
-    point: Optional[float] = None,
-) -> Optional[ValueCandidate]:
-    """Gathers every bookmaker's real price for one selection/line, computes
-    the leave-one-out consensus and the best-price edge, and returns a
-    ValueCandidate (with rejection_reasons populated if it does not meet
-    the minimum bookmaker count) or None if no bookmaker offered this
-    selection/line at all (nothing real to build a candidate from)."""
-    quotes: List[Dict[str, Any]] = []  # {"bookmaker", "price", "complete_prices"}
+def _build_candidate_for_outcome(group: MarketGroup, canonical: str) -> Optional[ValueCandidate]:
+    """Consumes one MarketGroup's already-deduplicated (bookmaker, price)
+    pairs for one canonical outcome and computes the leave-one-out
+    consensus vs. the real best price. Returns None only if there is
+    nothing at all to build from (should not happen once matching.py has
+    produced the group, but guards against an empty outcome list)."""
+    market_key = group.market
+    by_bookmaker: Dict[str, Dict[str, float]] = {}
+    for outcome_key, entries in group.outcomes.items():
+        for bookmaker, price, _point in entries:
+            by_bookmaker.setdefault(bookmaker, {})[outcome_key] = price
 
-    for title, _last_update, outcomes in _bookmaker_entries(event, market_key):
-        if point is not None:
-            outcomes = [o for o in outcomes if o.get("point") is not None and abs(float(o["point"]) - point) < 0.01]
-            if not outcomes:
-                continue
-        target = next((o for o in outcomes if outcome_matcher(o.get("name", ""))), None)
-        if target is None:
-            continue
-        try:
-            price = float(target.get("price"))
-            complete_prices = [float(o.get("price")) for o in outcomes if o.get("price") is not None]
-        except (TypeError, ValueError):
-            continue
-        if price <= 1.0 or len(complete_prices) < 2:
-            continue
-        quotes.append({"bookmaker": title, "price": price, "complete_prices": complete_prices})
+    quotes = []
+    for bookmaker, price, original_point in group.outcomes.get(canonical, []):
+        complete_prices = list(by_bookmaker.get(bookmaker, {}).values())
+        quotes.append({
+            "bookmaker": bookmaker, "price": price, "complete_prices": complete_prices,
+            "point": original_point,
+        })
 
     if not quotes:
         return None
@@ -199,25 +172,27 @@ def _build_for_selection(
         if p is not None:
             other_probs.append(p)
 
+    consensus = (sum(other_probs) / len(other_probs)) if other_probs else best_prob
+
     candidate = ValueCandidate(
-        event_id=event_id,
+        event_id=group.event_id,
         sport="soccer",
-        league=league,
+        league=group.league,
         country=None,
-        match_datetime=match_datetime,
-        home_team=home_team,
-        away_team=away_team,
-        market_type=market_type,
-        selection=selection_name,
-        line=point,
+        match_datetime=group.commence_time,
+        home_team=group.home_team,
+        away_team=group.away_team,
+        market_type=MARKET_KEY_TO_TYPE.get(market_key, market_key),
+        selection=_display_selection(market_key, canonical, group.home_team, group.away_team),
+        line=best["point"] if market_key == "spreads" else group.point,
         best_bookmaker=best["bookmaker"],
         best_price=best["price"],
         best_price_implied_probability=best_prob,
-        consensus_probability=(sum(other_probs) / len(other_probs)) if other_probs else best_prob,
+        consensus_probability=consensus,
         consensus_bookmaker_count=len(other_probs),
-        fair_price=(1.0 / (sum(other_probs) / len(other_probs))) if other_probs else (1.0 / best_prob),
-        edge=((sum(other_probs) / len(other_probs)) - best_prob) if other_probs else 0.0,
-        expected_value=(((sum(other_probs) / len(other_probs)) * best["price"]) - 1.0) if other_probs else -1.0,
+        fair_price=(1.0 / consensus) if consensus > 0 else float("inf"),
+        edge=(consensus - best_prob) if other_probs else 0.0,
+        expected_value=((consensus * best["price"]) - 1.0) if other_probs else -1.0,
         bookmaker_count=len(quotes),
         all_prices=[q["price"] for q in quotes],
     )
@@ -238,43 +213,14 @@ def _build_for_selection(
     return candidate
 
 
-def build_value_candidates_for_event(event: Dict[str, Any], *, event_id: str, league: Optional[str]) -> List[ValueCandidate]:
-    """Builds one ValueCandidate per real selection/line found in the raw
-    Odds API event for every supported market -- never invents a market or
-    selection that was not actually offered by at least one bookmaker."""
-    home_team = event.get("home_team", "")
-    away_team = event.get("away_team", "")
-    match_datetime = event.get("commence_time", "")
-    if not home_team or not away_team:
-        return []
-
+def build_value_candidates_from_groups(groups: Dict[Any, MarketGroup]) -> List[ValueCandidate]:
+    """Builds one ValueCandidate per real (event, market, point, outcome)
+    group -- never invents a market or selection that no bookmaker actually
+    offered, since groups only exist for outcomes matching.py actually saw."""
     candidates: List[ValueCandidate] = []
-
-    for market_key in ("h2h", "double_chance", "draw_no_bet"):
-        market_type = MARKET_KEY_TO_TYPE[market_key]
-        for selection_name, matcher in _selection_matchers(market_key, home_team, away_team):
-            candidate = _build_for_selection(
-                event=event, event_id=event_id, league=league,
-                market_key=market_key, market_type=market_type,
-                selection_name=selection_name, outcome_matcher=matcher,
-                home_team=home_team, away_team=away_team, match_datetime=match_datetime,
-            )
+    for group in groups.values():
+        for canonical in group.outcomes.keys():
+            candidate = _build_candidate_for_outcome(group, canonical)
             if candidate:
                 candidates.append(candidate)
-
-    for point in _distinct_totals_points(event):
-        for selection_name, matcher in (
-            ("Over", lambda name: name.lower() == "over"),
-            ("Under", lambda name: name.lower() == "under"),
-        ):
-            candidate = _build_for_selection(
-                event=event, event_id=event_id, league=league,
-                market_key="totals", market_type=MARKET_KEY_TO_TYPE["totals"],
-                selection_name=f"{selection_name} {point}", outcome_matcher=matcher,
-                home_team=home_team, away_team=away_team, match_datetime=match_datetime,
-                point=point,
-            )
-            if candidate:
-                candidates.append(candidate)
-
     return candidates

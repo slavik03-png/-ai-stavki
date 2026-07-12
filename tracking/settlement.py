@@ -50,6 +50,7 @@ MARKET_CORNERS_TOTAL = "corners_total"
 MARKET_CARDS_TOTAL = "cards_total"
 MARKET_FOULS_TOTAL = "fouls_total"
 MARKET_SHOTS_TOTAL = "shots_total"
+MARKET_SPREAD = "spread"
 
 _LINE_MARKETS = {
     MARKET_TOTAL_GOALS, MARKET_ASIAN_TOTAL, MARKET_TEAM_TOTAL,
@@ -256,6 +257,29 @@ def _settle_shots_total(p: Prediction, r: EventResult) -> SettlementOutcome:
     return _line_settlement(actual, p.line, p.selection, "статистика ударов недоступна")
 
 
+def _settle_spread(p: Prediction, r: EventResult) -> SettlementOutcome:
+    """Handicap/spread settlement (selection = 'home' | 'away', p.line is the
+    handicap exactly as offered for that selection, e.g. -2, +1.5, -0.75).
+    Reuses evaluate_over_under's quarter-line push/half-win logic: covering
+    a handicap H is equivalent to "goal difference in the selected team's
+    favour > -H", so the fractional (.25/.75) split-line mechanics already
+    used for totals apply unchanged."""
+    if r.home_goals is None or r.away_goals is None:
+        return _unresolved("итоговый счёт матча недоступен")
+    if p.line is None:
+        return _unresolved("гандикап (линия) не указан")
+    if p.selection == "home":
+        actual = r.home_goals - r.away_goals
+    elif p.selection == "away":
+        actual = r.away_goals - r.home_goals
+    else:
+        raise ValueError(f"unsupported spread selection {p.selection!r}")
+    status = evaluate_over_under(actual, -p.line, "over")
+    if status == STATUS_UNRESOLVED:
+        return _unresolved("не удалось однозначно рассчитать результат по гандикапу")
+    return status, f"разница голов {actual:+d}, гандикап {p.line:+g} ({p.selection}), счёт {r.final_score}"
+
+
 _SETTLERS = {
     MARKET_1X2: _settle_1x2,
     MARKET_DOUBLE_CHANCE: _settle_double_chance,
@@ -272,6 +296,7 @@ _SETTLERS = {
     MARKET_CARDS_TOTAL: _settle_cards_total,
     MARKET_FOULS_TOTAL: _settle_fouls_total,
     MARKET_SHOTS_TOTAL: _settle_shots_total,
+    MARKET_SPREAD: _settle_spread,
 }
 
 SUPPORTED_MARKET_TYPES = frozenset(_SETTLERS.keys())

@@ -188,6 +188,22 @@ def test_missing_data_never_guessed():
     check("unconfirmed match status produces unresolved", status == STATUS_UNRESOLVED)
 
 
+def test_spread():
+    r = _finished(home_goals=2, away_goals=0)
+    status, _ = settle_prediction(_p("spread", "home", line=-1.5), r)
+    check("home -1.5 covers when home wins by 2", status == STATUS_WON, status)
+    status, _ = settle_prediction(_p("spread", "home", line=-2.5), r)
+    check("home -2.5 does not cover when home wins by only 2", status == STATUS_LOST, status)
+    status, _ = settle_prediction(_p("spread", "home", line=-2.0), r)
+    check("home -2.0 pushes exactly on a 2-goal win", status == STATUS_RETURNED, status)
+    status, _ = settle_prediction(_p("spread", "away", line=1.5), r)
+    check("away +1.5 loses when away loses by 2", status == STATUS_LOST, status)
+    status, _ = settle_prediction(_p("spread", "home", line=-2.25), r)
+    check("home -2.25 quarter line half-loses on an exact 2-goal win", status == STATUS_HALF_LOST, status)
+    status, _ = settle_prediction(_p("spread", "home", line=None), r)
+    check("missing handicap line produces unresolved, never guessed", status == STATUS_UNRESOLVED, status)
+
+
 def run():
     test_1x2()
     test_double_chance()
@@ -204,6 +220,7 @@ def run():
     test_corners_cards_fouls_shots_totals()
     test_postponed_and_cancelled()
     test_missing_data_never_guessed()
+    test_spread()
 
     failed = [r for r in results if r[1] == "FAIL"]
     print(f"\n==SUMMARY== {len(results) - len(failed)}/{len(results)} passed")

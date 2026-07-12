@@ -8,9 +8,10 @@ import sys
 
 sys.path.insert(0, ".")
 
+from ai_predictions.matching import ValidationStats, dedupe_bookmaker_rows, extract_rows, group_rows, validate_rows
 from ai_predictions.value_engine import (
     MIN_BOOKMAKERS,
-    build_value_candidates_for_event,
+    build_value_candidates_from_groups,
 )
 
 results = []
@@ -26,6 +27,7 @@ def _event_with_bookmakers(prices):
     """prices: list of (title, home_price, draw_price, away_price)."""
     return {
         "id": "evt-1",
+        "_sport_key": "soccer_epl",
         "home_team": "Home FC",
         "away_team": "Away FC",
         "commence_time": "2026-07-13T12:00:00Z",
@@ -47,9 +49,18 @@ def _event_with_bookmakers(prices):
     }
 
 
+def _build_candidates(event, event_id="evt-1", league="Test League"):
+    rows = extract_rows(event, event_id=event_id, league=league)
+    stats = ValidationStats()
+    valid = validate_rows(rows, stats)
+    deduped = dedupe_bookmaker_rows(valid, stats)
+    groups = group_rows(deduped)
+    return build_value_candidates_from_groups(groups)
+
+
 def test_no_bookmakers_yields_no_candidates():
     event = _event_with_bookmakers([])
-    candidates = build_value_candidates_for_event(event, event_id="evt-1", league="Test League")
+    candidates = _build_candidates(event)
     check("no bookmakers -> no candidates at all", candidates == [], candidates)
 
 
@@ -59,7 +70,7 @@ def test_below_min_bookmakers_is_rejected_but_not_invented():
         ("BookA", 2.00, 3.30, 4.00),
         ("BookB", 2.00, 3.30, 4.00),
     ])
-    candidates = build_value_candidates_for_event(event, event_id="evt-1", league="Test League")
+    candidates = _build_candidates(event)
     home_candidates = [c for c in candidates if c.selection == "Home FC"]
     check("candidate is still built (real data) even below the bookmaker minimum", len(home_candidates) == 1)
     check("but is marked rejected for too few bookmakers",
@@ -76,7 +87,7 @@ def test_genuine_divergence_is_detected_and_passes():
         ("BookC", 2.02, 3.25, 3.95),
         ("BookD", 2.30, 3.10, 3.60),  # outlier, best price
     ])
-    candidates = build_value_candidates_for_event(event, event_id="evt-1", league="Test League")
+    candidates = _build_candidates(event)
     home = next(c for c in candidates if c.selection == "Home FC")
     check("best price is the real outlier price", home.best_price == 2.30, home.best_price)
     check("best bookmaker is correctly identified", home.best_bookmaker == "BookD")
@@ -93,7 +104,7 @@ def test_flat_market_has_near_zero_edge_and_is_rejected():
         ("BookC", 1.99, 3.31, 4.01),
         ("BookD", 2.00, 3.30, 4.00),
     ])
-    candidates = build_value_candidates_for_event(event, event_id="evt-1", league="Test League")
+    candidates = _build_candidates(event)
     home = next(c for c in candidates if c.selection == "Home FC")
     check("flat market produces near-zero edge", abs(home.edge) < 0.03, home.edge)
     check("flat market candidate is rejected, not recommended", not home.passed, home.rejection_reasons)
@@ -106,9 +117,63 @@ def test_only_real_selections_offered_by_bookmakers_are_built():
         ("BookB", 2.00, 3.30, 4.00),
         ("BookC", 2.00, 3.30, 4.00),
     ])
-    candidates = build_value_candidates_for_event(event, event_id="evt-1", league="Test League")
+    candidates = _build_candidates(event)
     check("no totals candidates invented when no bookmaker offered totals",
           all(c.market_type != "total_goals" for c in candidates), [c.market_type for c in candidates])
+
+
+def test_spreads_market_produces_settleable_candidates():
+    event = {
+        "id": "evt-spread",
+        "_sport_key": "soccer_epl",
+        "home_team": "Home FC",
+        "away_team": "Away FC",
+        "commence_time": "2026-07-13T12:00:00Z",
+        "bookmakers": [
+            {
+                "title": title,
+                "last_update": "2026-07-12T10:00:00Z",
+                "markets": [{
+                    "key": "spreads",
+                    "outcomes": [
+                        {"name": "Home FC", "price": h, "point": -1.5},
+                        {"name": "Away FC", "price": a, "point": 1.5},
+                    ],
+                }],
+            }
+            for title, h, a in [("BookA", 1.90, 1.95), ("BookB", 1.88, 1.97), ("BookC", 1.92, 1.93), ("BookD", 2.20, 1.65)]
+        ],
+    }
+    candidates = _build_candidates(event)
+    home = next(c for c in candidates if c.market_type == "spread" and c.selection == "Home FC")
+    check("spread candidate carries the real line", home.line == -1.5, home.line)
+    check("spread candidate detects the outlier as best price", home.best_bookmaker == "BookD", home.best_bookmaker)
+
+
+def test_h2h_lay_is_never_merged_into_h2h():
+    event = _event_with_bookmakers([
+        ("BookA", 2.00, 3.30, 4.00),
+        ("BookB", 2.00, 3.30, 4.00),
+        ("BookC", 2.00, 3.30, 4.00),
+    ])
+    event["bookmakers"].append({
+        "title": "ExchangeBook",
+        "last_update": "2026-07-12T10:00:00Z",
+        "markets": [{
+            "key": "h2h_lay",
+            "outcomes": [
+                {"name": "Home FC", "price": 2.10},
+                {"name": "Away FC", "price": 3.90},
+            ],
+        }],
+    })
+    rows = extract_rows(event, event_id="evt-1", league="Test League")
+    stats = ValidationStats()
+    valid = validate_rows(rows, stats)
+    check("h2h_lay rows are counted as unsupported, not silently dropped",
+          stats.unsupported_markets_seen.get("h2h_lay") == 2, stats.unsupported_markets_seen)
+    check("h2h_lay prices never leak into the valid h2h row set",
+          all(r.market != "h2h_lay" for r in valid))
 
 
 def run():
@@ -117,6 +182,8 @@ def run():
     test_genuine_divergence_is_detected_and_passes()
     test_flat_market_has_near_zero_edge_and_is_rejected()
     test_only_real_selections_offered_by_bookmakers_are_built()
+    test_spreads_market_produces_settleable_candidates()
+    test_h2h_lay_is_never_merged_into_h2h()
 
     failed = [r for r in results if r[1] == "FAIL"]
     print(f"\n==SUMMARY== {len(results) - len(failed)}/{len(results)} passed")

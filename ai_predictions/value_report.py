@@ -7,7 +7,9 @@ instead of a statistics-based confidence score.
 
 from __future__ import annotations
 
-from typing import List
+from collections import Counter
+from dataclasses import dataclass, field
+from typing import Dict, List
 
 from ai_predictions.value_engine import MIN_BOOKMAKERS, MIN_EDGE, ValueCandidate
 from ai_predictions.value_selector import ValueSelectionResult
@@ -18,6 +20,7 @@ MARKET_DISPLAY_NAMES = {
     "double_chance": "Двойной шанс",
     "draw_no_bet": "Без ничьей",
     "total_goals": "Тотал голов",
+    "spread": "Гандикап",
 }
 
 
@@ -25,27 +28,53 @@ def _fmt_pct(value: float) -> str:
     return f"{value * 100:+.1f}%"
 
 
+@dataclass
 class Diagnostics:
-    def __init__(self) -> None:
-        self.events_received = 0
-        self.markets_compared = 0
-        self.candidates_created = 0
-        self.candidates_rejected = 0
-        self.final_recommendations = 0
+    events_received: int = 0
+    events_excluded_by_window: int = 0
+    events_in_window: int = 0
+    rows_total: int = 0
+    rows_valid: int = 0
+    unique_events: int = 0
+    unique_groups: int = 0
+    groups_with_1_bookmaker: int = 0
+    groups_with_2_bookmakers: int = 0
+    groups_with_3plus_bookmakers: int = 0
+    markets_matched: int = 0
+    candidates_created: int = 0
+    candidates_rejected: int = 0
+    final_recommendations: int = 0
+    duplicate_bookmaker_rows: int = 0
+    unsupported_markets_seen: Dict[str, int] = field(default_factory=dict)
+    top_rejection_reasons: List[str] = field(default_factory=list)
 
     def as_lines(self) -> List[str]:
-        return [
+        lines = [
             f"Событий получено: {self.events_received}",
-            f"Рынков сопоставлено: {self.markets_compared}",
+            f"Исключено окном 36ч: {self.events_excluded_by_window}",
+            f"Событий в окне 36ч: {self.events_in_window}",
+            f"Строк котировок получено: {self.rows_total}",
+            f"Строк прошло валидацию: {self.rows_valid}",
+            f"Уникальных событий: {self.unique_events}",
+            f"Уникальных групп (событие+рынок+линия): {self.unique_groups}",
+            f"Групп с 1 букмекером: {self.groups_with_1_bookmaker}",
+            f"Групп с 2 букмекерами: {self.groups_with_2_bookmakers}",
+            f"Групп с 3+ букмекерами: {self.groups_with_3plus_bookmakers}",
+            f"Рынков сопоставлено (matched, 3+ букмекера): {self.markets_matched}",
             f"Кандидатов создано: {self.candidates_created}",
             f"Кандидатов отклонено: {self.candidates_rejected}",
             f"Итоговых рекомендаций: {self.final_recommendations}",
+            f"Дублей букмекеров (одна и та же ставка дважды): {self.duplicate_bookmaker_rows}",
         ]
+        if self.unsupported_markets_seen:
+            unsupported = ", ".join(f"{k} ({v})" for k, v in sorted(self.unsupported_markets_seen.items()))
+            lines.append(f"Неподдерживаемые рынки в ответе API (не смешиваются, не отброшены молча): {unsupported}")
+        return lines
 
 
 def _render_candidate(candidate: ValueCandidate, index: int) -> str:
     market_name = MARKET_DISPLAY_NAMES.get(candidate.market_type, candidate.market_type)
-    line_part = f" {candidate.line}" if candidate.line is not None else ""
+    line_part = f" {candidate.line:+g}" if candidate.line is not None else ""
     return (
         f"{index}. {candidate.home_team} — {candidate.away_team}\n"
         f"   Рынок: {market_name}{line_part}\n"
@@ -56,6 +85,17 @@ def _render_candidate(candidate: ValueCandidate, index: int) -> str:
         f"   Букмекеров по этому исходу: {candidate.bookmaker_count}\n"
         f"   Начало: {candidate.match_datetime}"
     )
+
+
+def compute_top_rejection_reasons(rejected: List[ValueCandidate], limit: int = 10) -> List[str]:
+    """Ranks rejection reasons by how often real candidates hit them --
+    frequency, not alphabetical order, so the most common real blocker
+    surfaces first."""
+    counter: Counter = Counter()
+    for candidate in rejected:
+        for reason in candidate.rejection_reasons:
+            counter[reason] += 1
+    return [f"{reason} (x{count})" for reason, count in counter.most_common(limit)]
 
 
 def render_value_report(result: ValueSelectionResult, diagnostics: Diagnostics) -> str:
@@ -73,13 +113,16 @@ def render_value_report(result: ValueSelectionResult, diagnostics: Diagnostics) 
     else:
         lines.append("Сегодня нет надёжных рекомендаций.\n")
         lines.append("Причины:")
-        if diagnostics.candidates_created == 0:
-            lines.append("- Не найдено ни одного реального исхода с котировками нескольких букмекеров в ближайшие 36 часов.")
+        if diagnostics.events_in_window == 0:
+            lines.append(
+                f"- Нет ни одного события в ближайшие 36 часов (событий получено всего: "
+                f"{diagnostics.events_received}, все исключены окном 36ч). Это не ошибка сопоставления "
+                f"— рынок просто не предлагает матчей в этом окне прямо сейчас."
+            )
+        elif diagnostics.candidates_created == 0:
+            lines.append("- Не найдено ни одного реального исхода с котировками нескольких букмекеров в событиях внутри окна 36 часов.")
         else:
-            reasons = set()
-            for c in result.rejected:
-                reasons.update(c.rejection_reasons)
-            for reason in sorted(reasons)[:8]:
+            for reason in diagnostics.top_rejection_reasons[:8]:
                 lines.append(f"- {reason}")
         lines.append(
             f"- Требуется минимум {MIN_BOOKMAKERS} букмекера и реальное расхождение не менее "
@@ -89,6 +132,10 @@ def render_value_report(result: ValueSelectionResult, diagnostics: Diagnostics) 
 
     lines.append("Диагностика:")
     lines.extend(diagnostics.as_lines())
+    if diagnostics.top_rejection_reasons:
+        lines.append("Топ причин отклонения:")
+        for reason in diagnostics.top_rejection_reasons:
+            lines.append(f"- {reason}")
     lines.append("")
     lines.append(DISCLAIMER)
     return "\n".join(lines)
