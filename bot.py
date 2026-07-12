@@ -12,7 +12,12 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 # Only the orchestration package is imported here -- never tracking/ or
 # selection_engine/ directly (see tests/test_selection_isolation.py and
 # tests/test_tracking_bot_isolation.py, which assert this boundary).
-from ai_predictions.pipeline import run_ai_predictions
+# The bot currently uses the cross-bookmaker value-detection strategy
+# (ai_predictions/value_pipeline.py), which only needs real odds -- no
+# football statistics provider. ai_predictions/pipeline.py (statistics +
+# odds) stays available for when a paid API-Football plan unlocks
+# current-season data.
+from ai_predictions.value_pipeline import run_value_predictions
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
@@ -209,9 +214,9 @@ async def send_cached(query, prefix: str) -> None:
 async def handle_ai_predictions(query) -> None:
     global ai_predictions_cache
 
-    if not ODDS_API_KEY or not FOOTBALL_API_KEY:
+    if not ODDS_API_KEY:
         await query.message.reply_text(
-            "❌ Для прогнозов ИИ нужны оба ключа: ODDS_API_KEY и FOOTBALL_API_KEY.",
+            "❌ Для прогнозов ИИ нужен ключ ODDS_API_KEY.",
             reply_markup=main_keyboard(),
         )
         return
@@ -252,11 +257,11 @@ async def handle_ai_predictions(query) -> None:
             return
 
         await query.message.reply_text(
-            "🤖 Анализирую матчи ближайших 36 часов (реальные коэффициенты + статистика)... "
+            "🤖 Анализирую матчи ближайших 36 часов (реальные коэффициенты нескольких букмекеров)... "
             "Это может занять минуту."
         )
         try:
-            result = await asyncio.to_thread(run_ai_predictions)
+            result = await asyncio.to_thread(run_value_predictions)
             ai_predictions_cache = {
                 "message": result.report_text,
                 "timestamp": datetime.now(timezone.utc).timestamp(),
