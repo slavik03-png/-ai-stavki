@@ -3,3 +3,4 @@
 - [API-Football free plan limits](api-football-free-plan-limits.md) — free tier blocks last/next params and any season outside 2022-2024; zero stats is expected, not a bug.
 - [Transient error cache poisoning](transient-error-cache-poisoning.md) — never cache a "not found" result for rate-limit/network/5xx errors; only cache confirmed empty answers.
 - [Value-divergence strategy design](value-divergence-strategy.md) — leave-one-out consensus avoids self-referential zero-edge; spreads excluded (no settlement support).
+- [Window-exclusion diagnostics & Odds API market fallback](window-exclusion-diagnostics.md) — 0-matched events often means "all events outside the time window", not broken matching; parse 422 market-rejection lists instead of collapsing to a minimal fallback.
