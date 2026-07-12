@@ -15,7 +15,7 @@ from typing import Dict, List, Optional, Sequence
 
 from selection_engine.config import (
     ConfidenceWeights,
-    MARKET_DATA_REQUIREMENTS,
+    market_requirements_for,
     SampleBand,
     SelectionConfig,
 )
@@ -283,7 +283,7 @@ def score_candidate(
     candidate.expected_value = compute_expected_value(candidate.model_probability, candidate.odds)
     candidate.fair_odds = compute_fair_odds(candidate.model_probability)
 
-    market_reqs = MARKET_DATA_REQUIREMENTS.get(candidate.market_type, {"required": [], "optional": []})
+    market_reqs = market_requirements_for(candidate.market_type, config)
     required = market_reqs["required"]
     optional = market_reqs["optional"]
     candidate.data_completeness = compute_data_completeness(candidate.available_fields, required, optional)

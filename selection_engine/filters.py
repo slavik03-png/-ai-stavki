@@ -14,7 +14,7 @@ from __future__ import annotations
 import datetime
 from typing import List, Sequence, Set, Tuple
 
-from selection_engine.config import MARKET_DATA_REQUIREMENTS, SelectionConfig
+from selection_engine.config import MARKET_DATA_REQUIREMENTS, SelectionConfig, market_requirements_for
 from selection_engine.models import CandidatePrediction
 from selection_engine.scoring import missing_required_fields
 
@@ -54,7 +54,7 @@ def apply_filters(
         reasons.append(f"Неизвестный/неподдерживаемый тип рынка '{candidate.market_type}'")
 
     # 4. Required data present
-    market_reqs = MARKET_DATA_REQUIREMENTS.get(candidate.market_type, {"required": [], "optional": []})
+    market_reqs = market_requirements_for(candidate.market_type, config)
     missing = missing_required_fields(candidate.available_fields, market_reqs["required"])
     if missing:
         reasons.append("Отсутствуют обязательные данные: " + ", ".join(missing))

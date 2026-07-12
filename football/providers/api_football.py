@@ -146,6 +146,13 @@ class ApiFootballProvider(FootballStatisticsProvider):
     # -- team/league resolution ----------------------------------------------
 
     def _resolve_team_id(self, team: str) -> "tuple[Optional[int], Optional[str]]":
+        # Only a confirmed empty search result (a real "not found" answer
+        # from the API) is cached permanently for this run. Transient
+        # failures (rate limiting, network errors, HTTP 5xx, exhausted
+        # budget) are deliberately NOT cached here -- caching them would
+        # turn a temporary problem into a permanent false "team not found"
+        # for the rest of the run, silently starving every market for that
+        # team of real data.
         key = team.strip().lower()
         if key in self._team_id_cache:
             cached = self._team_id_cache[key]
@@ -154,7 +161,6 @@ class ApiFootballProvider(FootballStatisticsProvider):
             return cached, None
         response, error = self._get("/teams", {"search": team})
         if error:
-            self._team_id_cache[key] = None
             return None, error
         if not response:
             self._team_id_cache[key] = None
@@ -164,6 +170,8 @@ class ApiFootballProvider(FootballStatisticsProvider):
         return team_id, None
 
     def _resolve_league_id(self, league: str) -> "tuple[Optional[int], Optional[str]]":
+        # See _resolve_team_id: only a confirmed empty result is cached as
+        # permanently unresolved; transient errors are never cached.
         key = league.strip().lower()
         if key in self._league_id_cache:
             cached = self._league_id_cache[key]
@@ -172,7 +180,6 @@ class ApiFootballProvider(FootballStatisticsProvider):
             return cached, None
         response, error = self._get("/leagues", {"search": league})
         if error:
-            self._league_id_cache[key] = None
             return None, error
         if not response:
             self._league_id_cache[key] = None
@@ -222,14 +229,14 @@ class ApiFootballProvider(FootballStatisticsProvider):
 
         team_id, error = self._resolve_team_id(team)
         if error:
-            self._last_matches_cache[cache_key] = Stat.missing(error)
+            # Transient (rate limit / network / budget) errors are not
+            # cached -- a retry within this same run may still succeed.
             return None, error
 
         # Ask API-Football for a few extra to allow for in-progress/postponed
         # entries that "last" sometimes still includes, then filter locally.
         response, error = self._fetch_fixtures(team_id, count + 5, "last")
         if error:
-            self._last_matches_cache[cache_key] = Stat.missing(error)
             return None, error
 
         finished = [fx for fx in response if (fx.get("fixture", {}).get("status", {}).get("short")) in FINISHED_STATUSES]
@@ -392,7 +399,10 @@ class ApiFootballProvider(FootballStatisticsProvider):
         fixture (a single call returns both teams' stats)."""
         if fixture_id not in self._fixture_stats_cache:
             response, error = self._get("/fixtures/statistics", {"fixture": fixture_id})
-            if error or not response:
+            if error:
+                # Transient failure -- do not cache, allow a later retry.
+                return None
+            if not response:
                 self._fixture_stats_cache[fixture_id] = None
             else:
                 by_team = {}
@@ -502,14 +512,12 @@ class ApiFootballProvider(FootballStatisticsProvider):
             return self._standings_cache[key]
         league_id, error = self._resolve_league_id(league)
         if error:
-            result = Stat.missing(error)
-            self._standings_cache[key] = result
-            return result
+            # Transient errors are not cached -- a retry within this run
+            # may still succeed once rate limiting clears.
+            return Stat.missing(error)
         response, error = self._get("/standings", {"league": league_id, "season": self.season})
         if error:
-            result = Stat.missing(error)
-            self._standings_cache[key] = result
-            return result
+            return Stat.missing(error)
         try:
             table = response[0]["league"]["standings"][0]
         except (IndexError, KeyError, TypeError):
@@ -570,14 +578,12 @@ class ApiFootballProvider(FootballStatisticsProvider):
             return self._injuries_cache[key]
         team_id, error = self._resolve_team_id(team)
         if error:
-            result = Stat.missing(error)
-            self._injuries_cache[key] = result
-            return result
+            # Transient errors are not cached -- a retry within this run
+            # may still succeed once rate limiting clears.
+            return Stat.missing(error)
         response, error = self._get("/injuries", {"team": team_id, "season": self.season})
         if error:
-            result = Stat.missing(error)
-            self._injuries_cache[key] = result
-            return result
+            return Stat.missing(error)
         if not response:
             result = Stat.ok([])  # explicitly known: no reported injuries
             self._injuries_cache[key] = result

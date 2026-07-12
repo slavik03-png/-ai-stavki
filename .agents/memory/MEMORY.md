@@ -1,2 +1,4 @@
 - [Confidence-blend missing-data trap](confidence-blend-missing-data.md) — dropping missing factors from a weighted average can raise confidence; blend them at neutral weight instead.
 - [tracking.statistics scale](tracking-stats-probability-scale.md) — Stats.win_rate/roi are 0..100 percent; divide by 100 before feeding a 0..1 probability field.
+- [API-Football free plan limits](api-football-free-plan-limits.md) — free tier blocks last/next params and any season outside 2022-2024; zero stats is expected, not a bug.
+- [Transient error cache poisoning](transient-error-cache-poisoning.md) — never cache a "not found" result for rate-limit/network/5xx errors; only cache confirmed empty answers.

@@ -149,6 +149,19 @@ def correlation_family(market_type: str) -> str:
     return CORRELATED_FAMILIES.get(market_type, market_type)
 
 
+def market_requirements_for(market_type: str, config: "SelectionConfig") -> Dict[str, List[str]]:
+    """Looks up the required/optional data fields for `market_type`,
+    honoring `config.market_data_requirements_override` first (a
+    per-run, explicit, documented relaxation -- e.g. when an upstream
+    statistics provider is entirely unavailable for a run) before
+    falling back to the default MARKET_DATA_REQUIREMENTS. Never invents
+    a requirement set for an unknown market."""
+    override = getattr(config, "market_data_requirements_override", None) or {}
+    if market_type in override:
+        return override[market_type]
+    return MARKET_DATA_REQUIREMENTS.get(market_type, {"required": [], "optional": []})
+
+
 # ---------------------------------------------------------------------------
 # Sample-size reliability bands
 # ---------------------------------------------------------------------------
@@ -262,6 +275,14 @@ class SelectionConfig:
 
     # Model version tag stored on every candidate/prediction produced here.
     model_version: str = AI_STAVKI_MODEL_VERSION
+
+    #: Per-run override of MARKET_DATA_REQUIREMENTS, keyed by market_type.
+    #: Empty by default (uses the module-level defaults for every market).
+    #: Intended for a documented, explicit, temporary relaxation -- e.g.
+    #: ai_predictions falls back to odds-only requirements when the
+    #: football statistics provider is entirely unavailable for a run
+    #: (see ai_predictions/pipeline.py) -- never a silent global change.
+    market_data_requirements_override: Dict[str, Dict[str, List[str]]] = field(default_factory=dict)
 
     def effective_allowed_markets(self) -> FrozenSet[str]:
         return frozenset(self.allowed_markets) - frozenset(self.disabled_markets)
