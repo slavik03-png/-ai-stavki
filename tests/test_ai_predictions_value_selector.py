@@ -1,6 +1,7 @@
 """
-Unit tests for ai_predictions/value_selector.py: per-level caps, ranking
-order, one-signal-per-event rules and the multi-market exception (Step 6).
+Unit tests for ai_predictions/value_selector.py: the global top-5 cap
+(HIGH always before MEDIUM before LOW), ranking order, one-signal-per-event
+rules, the multi-market exception, and the closest-rejected fallback.
 Builds ValueCandidate objects directly rather than through the odds JSON
 extraction pipeline, since selection logic is independent of how a
 candidate's signal_level/ranking_score were computed.
@@ -10,7 +11,7 @@ import sys
 
 sys.path.insert(0, ".")
 
-from ai_predictions.value_config import MAX_SIGNALS_PER_LEVEL, SIGNAL_HIGH, SIGNAL_LOW, SIGNAL_MEDIUM, SIGNAL_REJECTED
+from ai_predictions.value_config import MAX_TOTAL_SIGNALS, SIGNAL_HIGH, SIGNAL_LOW, SIGNAL_MEDIUM, SIGNAL_REJECTED
 from ai_predictions.value_engine import ValueCandidate
 from ai_predictions.value_selector import select_value_recommendations
 
@@ -37,27 +38,57 @@ def _candidate(event_id, market_type, selection, level, score, **overrides):
     return ValueCandidate(**base)
 
 
-def test_caps_at_max_signals_per_level():
+def test_caps_at_max_total_signals_globally():
+    # 8 independent HIGH candidates (different events) -- only
+    # MAX_TOTAL_SIGNALS (5) should survive across the WHOLE report, not
+    # per level.
     candidates = [
         _candidate(f"evt-{i}", "1x2", "Home FC", SIGNAL_HIGH, score=float(i))
-        for i in range(MAX_SIGNALS_PER_LEVEL + 3)
+        for i in range(MAX_TOTAL_SIGNALS + 3)
     ]
     result = select_value_recommendations(candidates)
-    check(f"never more than {MAX_SIGNALS_PER_LEVEL} HIGH signals shown",
-          len(result.high) == MAX_SIGNALS_PER_LEVEL, len(result.high))
+    check(f"never more than {MAX_TOTAL_SIGNALS} signals shown in total",
+          len(result.top_signals) == MAX_TOTAL_SIGNALS, len(result.top_signals))
     check("overflow candidates land in rejected, not silently dropped",
           len(result.rejected) == 3, len(result.rejected))
 
 
-def test_ranked_by_score_not_insertion_order():
+def test_high_always_precedes_medium_and_low_regardless_of_score():
+    # A LOW candidate with a much higher raw score must still rank BEHIND
+    # every HIGH/MEDIUM candidate -- tier is the primary sort key, never
+    # blended with score across tiers (spec: "prefer HIGH, then MEDIUM,
+    # then LOW").
+    candidates = [
+        _candidate("evt-low", "1x2", "Home FC", SIGNAL_LOW, score=100.0),
+        _candidate("evt-high", "totals", "Over 2.5", SIGNAL_HIGH, score=1.0),
+        _candidate("evt-medium", "double_chance", "1X", SIGNAL_MEDIUM, score=50.0),
+    ]
+    result = select_value_recommendations(candidates)
+    check("HIGH ranks first even with the lowest raw score",
+          [c.signal_level for c in result.top_signals] == [SIGNAL_HIGH, SIGNAL_MEDIUM, SIGNAL_LOW],
+          [c.signal_level for c in result.top_signals])
+
+
+def test_ranked_by_score_within_a_tier():
     candidates = [
         _candidate("evt-a", "1x2", "Home FC", SIGNAL_HIGH, score=1.0),
         _candidate("evt-b", "1x2", "Home FC", SIGNAL_HIGH, score=9.0),
         _candidate("evt-c", "1x2", "Home FC", SIGNAL_HIGH, score=5.0),
     ]
     result = select_value_recommendations(candidates)
-    check("signals are ordered by ranking_score, highest first",
-          [c.event_id for c in result.high] == ["evt-b", "evt-c", "evt-a"], [c.event_id for c in result.high])
+    check("within the same tier, signals are ordered by ranking_score, highest first",
+          [c.event_id for c in result.top_signals] == ["evt-b", "evt-c", "evt-a"],
+          [c.event_id for c in result.top_signals])
+
+
+def test_fewer_than_five_qualifying_are_never_padded():
+    candidates = [
+        _candidate("evt-a", "1x2", "Home FC", SIGNAL_HIGH, score=9.0),
+        _candidate("evt-b", "1x2", "Home FC", SIGNAL_MEDIUM, score=5.0),
+    ]
+    result = select_value_recommendations(candidates)
+    check("only the 2 genuinely qualifying signals are returned, nothing invented to reach 5",
+          len(result.top_signals) == 2, len(result.top_signals))
 
 
 def test_one_signal_per_event_same_market():
@@ -67,7 +98,8 @@ def test_one_signal_per_event_same_market():
     ]
     result = select_value_recommendations(candidates)
     check("only the stronger of two same-market signals on one event is shown",
-          len(result.high) == 1 and result.high[0].selection == "Away FC", [c.selection for c in result.high])
+          len(result.top_signals) == 1 and result.top_signals[0].selection == "Away FC",
+          [c.selection for c in result.top_signals])
     check("the weaker duplicate is recorded as rejected, not discarded silently",
           len(result.rejected) == 1)
 
@@ -79,7 +111,7 @@ def test_different_market_both_strong_gets_two_slots():
     ]
     result = select_value_recommendations(candidates)
     check("a HIGH 1x2 signal and a MEDIUM totals signal on the same event both survive",
-          len(result.high) + len(result.medium) == 2)
+          len(result.top_signals) == 2)
 
 
 def test_different_market_one_low_does_not_get_a_second_slot():
@@ -89,7 +121,8 @@ def test_different_market_one_low_does_not_get_a_second_slot():
     ]
     result = select_value_recommendations(candidates)
     check("a LOW signal never gets a second slot on an event that already has a HIGH signal",
-          len(result.high) == 1 and len(result.low) == 0, (len(result.high), len(result.low)))
+          len(result.top_signals) == 1 and result.top_signals[0].signal_level == SIGNAL_HIGH,
+          [c.signal_level for c in result.top_signals])
 
 
 def test_rejected_candidates_are_never_shown():
@@ -97,10 +130,24 @@ def test_rejected_candidates_are_never_shown():
         _candidate("evt-1", "1x2", "Home FC", SIGNAL_REJECTED, score=0.0),
     ]
     result = select_value_recommendations(candidates)
-    check("a REJECTED candidate never appears in high/medium/low",
-          not result.high and not result.medium and not result.low)
+    check("a REJECTED candidate never appears in top_signals",
+          not result.top_signals)
     check("a REJECTED candidate is tracked in the rejected bucket",
           len(result.rejected) == 1)
+
+
+def test_closest_rejected_populated_when_nothing_qualifies():
+    candidates = [
+        _candidate("evt-1", "1x2", "Home FC", SIGNAL_REJECTED, score=3.0),
+        _candidate("evt-2", "1x2", "Home FC", SIGNAL_REJECTED, score=8.0),
+        _candidate("evt-3", "1x2", "Home FC", SIGNAL_REJECTED, score=1.0),
+    ]
+    result = select_value_recommendations(candidates)
+    check("closest_rejected is populated, ranked by ranking_score (closest to qualifying first)",
+          [c.event_id for c in result.closest_rejected] == ["evt-2", "evt-1", "evt-3"],
+          [c.event_id for c in result.closest_rejected])
+    check("closest_rejected never exceeds the global cap",
+          len(result.closest_rejected) <= MAX_TOTAL_SIGNALS)
 
 
 def test_main_alias_orders_high_then_medium_then_low():
@@ -116,12 +163,15 @@ def test_main_alias_orders_high_then_medium_then_low():
 
 
 def run():
-    test_caps_at_max_signals_per_level()
-    test_ranked_by_score_not_insertion_order()
+    test_caps_at_max_total_signals_globally()
+    test_high_always_precedes_medium_and_low_regardless_of_score()
+    test_ranked_by_score_within_a_tier()
+    test_fewer_than_five_qualifying_are_never_padded()
     test_one_signal_per_event_same_market()
     test_different_market_both_strong_gets_two_slots()
     test_different_market_one_low_does_not_get_a_second_slot()
     test_rejected_candidates_are_never_shown()
+    test_closest_rejected_populated_when_nothing_qualifies()
     test_main_alias_orders_high_then_medium_then_low()
 
     failed = [r for r in results if r[1] == "FAIL"]

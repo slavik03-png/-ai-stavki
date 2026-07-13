@@ -68,7 +68,15 @@ FLAT_PRICES = [
 
 
 def _run_with_events(events, tmp_db_path):
-    value_pipeline_mod.fetch_football_events = lambda api_key=None: (events, "500", [])
+    from ai_predictions.odds_client import MultiSportFetchResult, SportsDiscovery
+
+    fake_discovery = SportsDiscovery(
+        included=["soccer_epl"], all_active_football=["soccer_epl"], skipped={}, source="api",
+    )
+    value_pipeline_mod.fetch_all_active_football_events = lambda api_key=None: MultiSportFetchResult(
+        events=events, credits_remaining="500", errors=[], discovery=fake_discovery,
+        sports_queried=["soccer_epl"], sports_failed={},
+    )
     storage = TrackingStorage(db_path=tmp_db_path)
     result = value_pipeline_mod.run_value_predictions(odds_api_key="fake-odds-key", storage=storage, now=NOW)
     return result, storage

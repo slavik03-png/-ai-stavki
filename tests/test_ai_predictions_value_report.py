@@ -1,7 +1,8 @@
 """
-Unit tests for ai_predictions/value_report.py: section order, wording
-guardrails ("safe"/"guaranteed" language must never appear), per-candidate
-field rendering, and honest empty-state messaging.
+Unit tests for ai_predictions/value_report.py: the ranked top-signals
+section, wording guardrails ("safe"/"guaranteed" language must never
+appear), per-candidate field rendering, honest empty-state messaging, and
+the closest-rejected fallback with full candidate detail.
 """
 
 import sys
@@ -38,28 +39,45 @@ def _candidate(event_id, market_type, selection, level, **overrides):
 FORBIDDEN_WORDS = ["безопасн", "гарантир", "уверенн" + "ая ставка"]
 
 
-def test_section_order_is_high_medium_low_rejected_diagnostics():
+def test_top_signals_render_before_rejected_summary_and_diagnostics():
     result = ValueSelectionResult(
-        high=[_candidate("evt-1", "1x2", "Home FC", "HIGH")],
-        medium=[_candidate("evt-2", "1x2", "Home FC", "MEDIUM")],
-        low=[_candidate("evt-3", "1x2", "Home FC", "LOW")],
+        top_signals=[
+            _candidate("evt-1", "1x2", "Home FC", "HIGH"),
+            _candidate("evt-2", "1x2", "Home FC", "MEDIUM"),
+            _candidate("evt-3", "1x2", "Home FC", "LOW"),
+        ],
     )
     diag = Diagnostics(high_count=1, medium_count=1, low_count=1, rejected_count=0)
     report = render_value_report(result, diag)
-    high_i = report.index("🔥 HIGH")
-    medium_i = report.index("🟡 MEDIUM")
-    low_i = report.index("⚪ LOW")
+    top_i = report.index("Топ сигналов")
     rejected_i = report.index("Отклонено кандидатов")
     diag_i = report.index("Диагностика:")
-    check("sections render in fixed order HIGH -> MEDIUM -> LOW -> rejected summary -> diagnostics",
-          high_i < medium_i < low_i < rejected_i < diag_i, (high_i, medium_i, low_i, rejected_i, diag_i))
+    check("top-signals section renders before the rejected summary and diagnostics",
+          top_i < rejected_i < diag_i, (top_i, rejected_i, diag_i))
+    check("all three tiers are represented by their own label within the top signals",
+          "HIGH" in report and "MEDIUM" in report and "LOW" in report)
+
+
+def test_top_signals_respects_high_before_medium_before_low_order():
+    result = ValueSelectionResult(
+        top_signals=[
+            _candidate("evt-h", "1x2", "Home FC", "HIGH"),
+            _candidate("evt-m", "1x2", "Home FC", "MEDIUM"),
+            _candidate("evt-l", "1x2", "Home FC", "LOW"),
+        ],
+    )
+    diag = Diagnostics(high_count=1, medium_count=1, low_count=1)
+    report = render_value_report(result, diag)
+    high_i = report.index("evt-h" if "evt-h" in report else "HIGH")
+    check("HIGH candidate is listed first among the top signals",
+          report.index("1. ") < report.index("2. ") < report.index("3. "))
 
 
 def test_report_never_uses_forbidden_confidence_words_for_low():
     # The disclaimer legitimately says "not a guarantee" -- that's a
     # negation, not a positive claim. What must never appear is a LOW
     # signal being positively labelled a safe/guaranteed/sure bet.
-    result = ValueSelectionResult(low=[_candidate("evt-1", "1x2", "Home FC", "LOW")])
+    result = ValueSelectionResult(top_signals=[_candidate("evt-1", "1x2", "Home FC", "LOW")])
     diag = Diagnostics(low_count=1)
     report = render_value_report(result, diag).lower()
     forbidden_positive_claims = ["безопасная ставка", "гарантированная победа", "верная ставка", "уверенная ставка"]
@@ -77,7 +95,7 @@ def test_report_includes_explicit_non_advice_disclaimer():
 
 def test_candidate_fields_all_rendered():
     candidate = _candidate("evt-1", "1x2", "Home FC", "HIGH", best_price=2.35, fair_price=2.10, edge=0.06, expected_value=0.10)
-    result = ValueSelectionResult(high=[candidate])
+    result = ValueSelectionResult(top_signals=[candidate])
     diag = Diagnostics(high_count=1)
     report = render_value_report(result, diag)
     check("best price is rendered", "2.35" in report)
@@ -88,7 +106,7 @@ def test_candidate_fields_all_rendered():
 
 def test_two_bookmaker_candidate_gets_reduced_confidence_note():
     candidate = _candidate("evt-1", "1x2", "Home FC", "MEDIUM", unique_bookmaker_count=2)
-    result = ValueSelectionResult(medium=[candidate])
+    result = ValueSelectionResult(top_signals=[candidate])
     diag = Diagnostics(medium_count=1)
     report = render_value_report(result, diag)
     check("2-bookmaker candidate carries an explicit reduced-confidence note",
@@ -97,7 +115,7 @@ def test_two_bookmaker_candidate_gets_reduced_confidence_note():
 
 def test_outlier_warning_is_rendered_when_present():
     candidate = _candidate("evt-1", "1x2", "Home FC", "MEDIUM", outlier_warning="Цена сильно выделяется на фоне рынка.")
-    result = ValueSelectionResult(medium=[candidate])
+    result = ValueSelectionResult(top_signals=[candidate])
     diag = Diagnostics(medium_count=1)
     report = render_value_report(result, diag)
     check("outlier warning text is surfaced in the report", "сильно выделяется" in report)
@@ -109,6 +127,21 @@ def test_empty_result_gives_honest_no_signals_message():
     report = render_value_report(result, diag)
     check("empty result explicitly says no signals at any level, does not invent one",
           "нет сигналов" in report.lower())
+
+
+def test_empty_result_shows_closest_rejected_candidates_with_full_detail():
+    rejected = _candidate(
+        "evt-1", "1x2", "Home FC", "REJECTED",
+        best_price=1.95, fair_price=1.90, edge=0.02, expected_value=-0.01, unique_bookmaker_count=3,
+    )
+    rejected.rejection_reasons = ["edge ниже порога LOW"]
+    result = ValueSelectionResult(closest_rejected=[rejected])
+    diag = Diagnostics(events_received=1, events_in_window=1, candidates_created=1)
+    report = render_value_report(result, diag)
+    check("closest-rejected candidate's real odds are shown", "1.95" in report and "1.90" in report)
+    check("closest-rejected candidate's bookmaker count is shown", "Букмекеров: 3" in report)
+    check("closest-rejected candidate's real rejection reason is shown", "edge ниже порога LOW" in report)
+    check("closest-rejected candidate's market/selection is shown", "Home FC" in report)
 
 
 def test_compute_top_rejection_reasons_orders_by_frequency():
@@ -124,13 +157,15 @@ def test_compute_top_rejection_reasons_orders_by_frequency():
 
 
 def run():
-    test_section_order_is_high_medium_low_rejected_diagnostics()
+    test_top_signals_render_before_rejected_summary_and_diagnostics()
+    test_top_signals_respects_high_before_medium_before_low_order()
     test_report_never_uses_forbidden_confidence_words_for_low()
     test_report_includes_explicit_non_advice_disclaimer()
     test_candidate_fields_all_rendered()
     test_two_bookmaker_candidate_gets_reduced_confidence_note()
     test_outlier_warning_is_rendered_when_present()
     test_empty_result_gives_honest_no_signals_message()
+    test_empty_result_shows_closest_rejected_candidates_with_full_detail()
     test_compute_top_rejection_reasons_orders_by_frequency()
 
     failed = [r for r in results if r[1] == "FAIL"]

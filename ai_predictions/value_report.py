@@ -70,8 +70,28 @@ class Diagnostics:
     outlier_warning_count: int = 0
     remaining_odds_api_credits: "int | str | None" = None
 
+    # -- dynamic event-discovery diagnostics (production-discovery fix) --
+    sports_discovered: List[str] = field(default_factory=list)
+    sports_queried: List[str] = field(default_factory=list)
+    sports_skipped: Dict[str, str] = field(default_factory=dict)
+    discovery_source: str = "api"  # "api" or "fallback_hardcoded"
+    discovery_error: "str | None" = None
+
     def as_lines(self) -> List[str]:
         lines = [
+            f"Активных футбольных турниров обнаружено: {len(self.sports_discovered)}",
+            f"Турниров успешно опрошено: {len(self.sports_queried)}",
+            f"Турниров пропущено: {len(self.sports_skipped)}",
+        ]
+        if self.discovery_source == "fallback_hardcoded":
+            lines.append(
+                f"⚠️ Живой список видов спорта The Odds API недоступен "
+                f"({self.discovery_error}) — использован резервный список из 7 крупных лиг."
+            )
+        if self.sports_skipped:
+            skipped_preview = "; ".join(f"{k} — {v}" for k, v in list(self.sports_skipped.items())[:10])
+            lines.append(f"Пропущенные турниры и причины: {skipped_preview}")
+        lines.extend([
             f"Событий получено: {self.events_received}",
             f"Исключено окном 36ч: {self.events_excluded_by_window}",
             f"Событий в окне 36ч: {self.events_in_window}",
@@ -90,7 +110,7 @@ class Diagnostics:
             f"Отклонено: {self.rejected_count}",
             f"Предупреждений о выбросе цены: {self.outlier_warning_count}",
             f"Дублей букмекеров (одна и та же ставка дважды): {self.duplicate_bookmaker_rows}",
-        ]
+        ])
         if self.remaining_odds_api_credits is not None:
             lines.append(f"Осталось кредитов The Odds API: {self.remaining_odds_api_credits}")
         if self.unsupported_markets_seen:
@@ -144,34 +164,43 @@ def compute_top_rejection_reasons(rejected: List[ValueCandidate], limit: int = 1
     return [f"{reason} (x{count})" for reason, count in counter.most_common(limit)]
 
 
-def _render_section(title: str, candidates: List[ValueCandidate]) -> List[str]:
-    lines = [title]
-    if not candidates:
-        lines.append("Нет сигналов этого уровня.")
-        return lines
-    for i, candidate in enumerate(candidates, start=1):
-        lines.append(_render_candidate(candidate, i))
-        lines.append("")
-    return lines
+def _render_rejected_candidate(candidate: ValueCandidate, index: int) -> str:
+    market_name = MARKET_DISPLAY_NAMES.get(candidate.market_type, candidate.market_type)
+    line_part = f" {candidate.line:+g}" if candidate.line is not None else ""
+    reason = candidate.rejection_reasons[0] if candidate.rejection_reasons else "не указана"
+    lines = [
+        f"{index}. {candidate.league or candidate.sport}: "
+        f"{candidate.home_team} — {candidate.away_team}",
+        f"Рынок: {market_name}{line_part} | Исход: {candidate.selection}",
+        f"Лучшая цена: {candidate.best_price:.2f} — {candidate.best_bookmaker} | "
+        f"Справедливая цена: {candidate.fair_price:.2f}",
+        f"Расхождение (edge): {_fmt_pct(candidate.edge)} | "
+        f"Ожидаемая ценность (EV): {_fmt_pct(candidate.expected_value)} | "
+        f"Букмекеров: {candidate.unique_bookmaker_count}",
+        f"Причина отклонения: {reason}",
+    ]
+    return "\n".join(lines)
 
 
 def render_value_report(result: ValueSelectionResult, diagnostics: Diagnostics) -> str:
     lines = ["AI Ставки — ранжированные рыночные сигналы (реальные коэффициенты, без статистики)\n"]
     lines.append(
         "Метод: сравнение реальных коэффициентов нескольких букмекеров по одному и тому же "
-        "исходу. Никакая статистика команд не используется и не изобретается — только реальные цены. "
-        "Это система ранжирования и исследования рынка, а не гарантия прибыли.\n"
+        "исходу, по всем активным футбольным турнирам The Odds API прямо сейчас — не только "
+        "по крупным лигам. Никакая статистика команд не используется и не изобретается — только "
+        "реальные цены. Это система ранжирования и исследования рынка, а не гарантия прибыли.\n"
     )
     lines.append(_NEVER_WORDS_NOTE)
     lines.append("")
 
-    if not (result.high or result.medium or result.low):
+    if not result.top_signals:
         lines.append("Сегодня нет сигналов ни одного уровня (HIGH/MEDIUM/LOW).\n")
         lines.append("Причины:")
         if diagnostics.events_in_window == 0:
             lines.append(
                 f"- Нет ни одного события в ближайшие 36 часов (событий получено всего: "
-                f"{diagnostics.events_received}, все исключены окном 36ч). Это не ошибка сопоставления "
+                f"{diagnostics.events_received}, все исключены окном 36ч, "
+                f"турниров опрошено: {len(diagnostics.sports_queried)}). Это не ошибка сопоставления "
                 f"— рынок просто не предлагает матчей в этом окне прямо сейчас."
             )
         elif diagnostics.candidates_created == 0:
@@ -181,9 +210,19 @@ def render_value_report(result: ValueSelectionResult, diagnostics: Diagnostics) 
                 lines.append(f"- {reason}")
         lines.append("")
 
-    lines.extend(_render_section("🔥 HIGH", result.high))
-    lines.extend(_render_section("🟡 MEDIUM", result.medium))
-    lines.extend(_render_section("⚪ LOW", result.low))
+        if result.closest_rejected:
+            lines.append(f"5 ближайших к порогу отклонённых кандидатов (реальные цены, ничего не выдумано):")
+            for i, candidate in enumerate(result.closest_rejected, start=1):
+                lines.append(_render_rejected_candidate(candidate, i))
+                lines.append("")
+    else:
+        lines.append(
+            f"Топ сигналов (до {len(result.top_signals)} из общего пула, приоритет HIGH \u2192 MEDIUM \u2192 LOW):"
+        )
+        lines.append("")
+        for i, candidate in enumerate(result.top_signals, start=1):
+            lines.append(_render_candidate(candidate, i))
+            lines.append("")
 
     lines.append(f"Отклонено кандидатов: {len(result.rejected)}")
     if diagnostics.top_rejection_reasons:

@@ -74,7 +74,11 @@ OUTLIER_DEMOTES_BY_ONE_LEVEL = True
 # Output volume / ranking (Step 6).
 # ---------------------------------------------------------------------------
 
-MAX_SIGNALS_PER_LEVEL = 5
+#: Global cap across ALL levels combined (Step 8/9/10 of the
+#: production-discovery spec): the report shows at most this many signals
+#: total, filled HIGH first, then MEDIUM, then LOW -- never padded with
+#: weaker candidates just to reach this number.
+MAX_TOTAL_SIGNALS = 5
 
 #: Ranking-score weights (see value_engine.compute_ranking_score for the
 #: exact formula). All real, observable inputs -- EV, edge, bookmaker

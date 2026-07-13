@@ -2,14 +2,17 @@
 End-to-end orchestration for the ranked HIGH/MEDIUM/LOW/REJECTED
 cross-bookmaker value-detection strategy:
 
-  fetch real odds -> 36h window filter -> extract/validate/dedupe/group
-  real bookmaker rows (ai_predictions/matching.py) -> build real
-  ValueCandidates with a signal_level + ranking_score from cross-bookmaker
-  price divergence (ai_predictions/value_engine.py) -> select up to 5 per
-  level, one signal per event with limited exceptions
-  (ai_predictions/value_selector.py) -> persist EVERY evaluated candidate
-  (including REJECTED ones) to tracking, dedup-safe -> render the Russian
-  report text with full pipeline diagnostics.
+  discover every active football competition from The Odds API (not a
+  hardcoded major-league list) -> fetch real odds for all of them -> 36h
+  window filter -> extract/validate/dedupe/group real bookmaker rows
+  (ai_predictions/matching.py) -> build real ValueCandidates with a
+  signal_level + ranking_score from cross-bookmaker price divergence
+  (ai_predictions/value_engine.py) -> rank ALL candidates globally
+  (HIGH -> MEDIUM -> LOW) and keep up to 5 total, one signal per event
+  with limited exceptions (ai_predictions/value_selector.py) -> persist
+  EVERY evaluated candidate (including REJECTED ones) to tracking,
+  dedup-safe -> render the Russian report text with full pipeline and
+  event-discovery diagnostics.
 
 Deliberately does not call football/ or ApiFootballProvider at all: this
 strategy needs no team statistics. The API-Football integration
@@ -33,7 +36,7 @@ from ai_predictions.matching import (
     raw_bookmaker_row_counts,
     validate_rows,
 )
-from ai_predictions.odds_client import fetch_football_events
+from ai_predictions.odds_client import fetch_all_active_football_events
 from ai_predictions.value_config import (
     LOW_MIN_BOOKMAKERS,
     MODEL_VERSION,
@@ -98,6 +101,9 @@ class ValuePipelineResult:
     high_count: int = 0
     medium_count: int = 0
     low_count: int = 0
+    sports_discovered: List[str] = field(default_factory=list)
+    sports_queried: List[str] = field(default_factory=list)
+    sports_skipped: Dict[str, str] = field(default_factory=dict)
 
 
 def _event_id(event: Dict[str, Any]) -> str:
@@ -189,7 +195,14 @@ def run_value_predictions(
     owns_storage = storage is None
     storage = storage or TrackingStorage()
 
-    events, _credits, odds_errors = fetch_football_events(api_key=odds_api_key)
+    fetch_result = fetch_all_active_football_events(api_key=odds_api_key)
+    events = fetch_result.events
+    credits_remaining = fetch_result.credits_remaining
+    odds_errors = list(fetch_result.errors)
+    discovery = fetch_result.discovery
+    sports_skipped: Dict[str, str] = dict(discovery.skipped)
+    sports_skipped.update(fetch_result.sports_failed)
+
     in_window, excluded = filter_events_in_window(events, now)
     if max_events is not None:
         in_window = in_window[:max_events]
@@ -226,6 +239,13 @@ def run_value_predictions(
     result = select_value_recommendations(all_candidates)
 
     outlier_warning_count = sum(1 for c in all_candidates if c.outlier_warning)
+    # Real total counts per level across EVERY evaluated candidate this
+    # run (Step 12) -- deliberately independent of how many made it into
+    # the displayed top_signals list, which is capped at MAX_TOTAL_SIGNALS.
+    high_total = sum(1 for c in all_candidates if c.signal_level == SIGNAL_HIGH)
+    medium_total = sum(1 for c in all_candidates if c.signal_level == SIGNAL_MEDIUM)
+    low_total = sum(1 for c in all_candidates if c.signal_level == SIGNAL_LOW)
+    rejected_total = sum(1 for c in all_candidates if c.signal_level == SIGNAL_REJECTED)
 
     diagnostics = Diagnostics(
         events_received=len(events),
@@ -240,16 +260,22 @@ def run_value_predictions(
         groups_with_3plus_bookmakers=groups_3plus,
         markets_matched=markets_matched,
         candidates_created=len(all_candidates),
-        candidates_rejected=len(result.rejected),
-        final_recommendations=len(result.main),
+        candidates_rejected=rejected_total,
+        final_recommendations=len(result.top_signals),
         duplicate_bookmaker_rows=stats.duplicate_bookmaker_rows,
         unsupported_markets_seen=dict(stats.unsupported_markets_seen),
         top_rejection_reasons=compute_top_rejection_reasons(result.rejected),
-        high_count=len(result.high),
-        medium_count=len(result.medium),
-        low_count=len(result.low),
-        rejected_count=len(result.rejected),
+        high_count=high_total,
+        medium_count=medium_total,
+        low_count=low_total,
+        rejected_count=rejected_total,
         outlier_warning_count=outlier_warning_count,
+        remaining_odds_api_credits=credits_remaining,
+        sports_discovered=discovery.all_active_football,
+        sports_queried=fetch_result.sports_queried,
+        sports_skipped=sports_skipped,
+        discovery_source=discovery.source,
+        discovery_error=discovery.discovery_error,
     )
 
     debug_groups: List[str] = []
@@ -269,14 +295,17 @@ def run_value_predictions(
         events_excluded_by_window=excluded,
         markets_compared=diagnostics.unique_groups,
         candidates_created=len(all_candidates),
-        candidates_rejected=len(result.rejected),
-        final_recommendations=len(result.main),
+        candidates_rejected=rejected_total,
+        final_recommendations=len(result.top_signals),
         saved_count=saved,
         duplicate_count=duplicates,
         diagnostics=diagnostics,
         debug_groups=debug_groups,
         errors=odds_errors,
-        high_count=len(result.high),
-        medium_count=len(result.medium),
-        low_count=len(result.low),
+        high_count=high_total,
+        medium_count=medium_total,
+        low_count=low_total,
+        sports_discovered=discovery.all_active_football,
+        sports_queried=fetch_result.sports_queried,
+        sports_skipped=sports_skipped,
     )

@@ -5,13 +5,18 @@ signal_level and ranking_score are computed).
 
 Rules (all from the spec, not invented):
 - candidates are already leveled by value_engine.classify_signal before
-  they reach this module -- this module only buckets, caps and dedupes;
-- up to MAX_SIGNALS_PER_LEVEL per level (HIGH/MEDIUM/LOW);
-- ranked within each level by ranking_score (transparent, documented in
-  value_engine.compute_ranking_score), never by best_price alone;
+  they reach this module -- this module only dedupes, ranks and caps;
 - at most one displayed signal per event, UNLESS two signals concern
-  clearly different markets and BOTH pass MEDIUM or HIGH (Step 6) -- LOW
-  signals never get a second slot on the same event.
+  clearly different markets and BOTH pass MEDIUM or HIGH -- a LOW never
+  gets a second slot on the same event;
+- candidates are then ranked GLOBALLY across every level and event --
+  HIGH always before MEDIUM before LOW (never blended by score across
+  tiers), score-ordered within a tier -- and only the top MAX_TOTAL_SIGNALS
+  survive; nothing is padded to reach that number;
+- if zero signals qualify at all, the closest REJECTED candidates (by
+  ranking_score, i.e. how close they came to a real threshold) are kept
+  separately so the report can show *why* nothing qualified with real
+  numbers instead of an empty screen.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List
 
 from ai_predictions.value_config import (
-    MAX_SIGNALS_PER_LEVEL,
+    MAX_TOTAL_SIGNALS,
     SIGNAL_HIGH,
     SIGNAL_LOW,
     SIGNAL_MEDIUM,
@@ -28,33 +33,60 @@ from ai_predictions.value_config import (
 )
 from ai_predictions.value_engine import ValueCandidate
 
-_DISPLAYED_LEVELS = (SIGNAL_HIGH, SIGNAL_MEDIUM, SIGNAL_LOW)
 _MULTI_MARKET_ELIGIBLE_LEVELS = (SIGNAL_HIGH, SIGNAL_MEDIUM)
+_TIER_RANK = {SIGNAL_HIGH: 0, SIGNAL_MEDIUM: 1, SIGNAL_LOW: 2}
+
+
+def _sort_key(candidate: ValueCandidate):
+    """HIGH always sorts before MEDIUM before LOW (tier is the primary
+    key); within a tier, higher ranking_score first."""
+    return (_TIER_RANK[candidate.signal_level], -candidate.ranking_score)
 
 
 @dataclass
 class ValueSelectionResult:
-    high: List[ValueCandidate] = field(default_factory=list)
-    medium: List[ValueCandidate] = field(default_factory=list)
-    low: List[ValueCandidate] = field(default_factory=list)
+    #: Up to MAX_TOTAL_SIGNALS candidates, globally ranked HIGH -> MEDIUM
+    #: -> LOW (then by ranking_score within a tier). This is the single
+    #: list the report shows -- never split into separate per-level caps.
+    top_signals: List[ValueCandidate] = field(default_factory=list)
+    #: Every candidate that did NOT make top_signals, for any reason
+    #: (genuinely REJECTED by value_engine, bumped by per-event dedup, or
+    #: outranked for the last global slot) -- always fully persisted to
+    #: tracking regardless.
     rejected: List[ValueCandidate] = field(default_factory=list)
+    #: The 5 REJECTED candidates that came closest to qualifying (highest
+    #: ranking_score among genuinely REJECTED candidates), shown only when
+    #: top_signals is empty (Step 11).
+    closest_rejected: List[ValueCandidate] = field(default_factory=list)
+
+    @property
+    def high(self) -> List[ValueCandidate]:
+        return [c for c in self.top_signals if c.signal_level == SIGNAL_HIGH]
+
+    @property
+    def medium(self) -> List[ValueCandidate]:
+        return [c for c in self.top_signals if c.signal_level == SIGNAL_MEDIUM]
+
+    @property
+    def low(self) -> List[ValueCandidate]:
+        return [c for c in self.top_signals if c.signal_level == SIGNAL_LOW]
 
     @property
     def main(self) -> List[ValueCandidate]:
-        """Backward-compatible alias for any code still expecting one flat
-        "recommended" list -- HIGH first, then MEDIUM, then LOW."""
-        return [*self.high, *self.medium, *self.low]
+        """Backward-compatible alias for the flat displayed list."""
+        return self.top_signals
 
     @property
     def all_displayed(self) -> List[ValueCandidate]:
-        return self.main
+        return self.top_signals
 
 
 def _dedupe_per_event(candidates: List[ValueCandidate]) -> "tuple[List[ValueCandidate], List[ValueCandidate]]":
     """At most one signal per event, except a second signal is allowed
     when it is on a clearly different market AND both candidates are
-    MEDIUM or HIGH. Ranking-score order decides which signal(s) win when
-    more exist than slots for that event."""
+    MEDIUM or HIGH. Works across ALL tiers at once (not level-by-level),
+    so the strongest signal for an event always wins regardless of which
+    tier the competing candidates landed in."""
     by_event: Dict[str, List[ValueCandidate]] = {}
     for c in candidates:
         by_event.setdefault(c.event_id, []).append(c)
@@ -62,7 +94,7 @@ def _dedupe_per_event(candidates: List[ValueCandidate]) -> "tuple[List[ValueCand
     kept: List[ValueCandidate] = []
     bumped: List[ValueCandidate] = []
     for event_id, group in by_event.items():
-        group = sorted(group, key=lambda c: c.ranking_score, reverse=True)
+        group = sorted(group, key=_sort_key)
         best = group[0]
         kept.append(best)
         for extra in group[1:]:
@@ -75,68 +107,34 @@ def _dedupe_per_event(candidates: List[ValueCandidate]) -> "tuple[List[ValueCand
                 kept.append(extra)
             else:
                 extra.rejection_reasons.append(
-                    f"По этому событию уже выбран более сильный сигнал того же типа "
-                    f"({best.selection}, score {best.ranking_score:.2f})"
+                    f"По этому событию уже выбран более сильный сигнал "
+                    f"({best.selection}, {best.signal_level}, score {best.ranking_score:.2f})"
                 )
                 bumped.append(extra)
     return kept, bumped
 
 
 def select_value_recommendations(candidates: List[ValueCandidate]) -> ValueSelectionResult:
-    result = ValueSelectionResult()
-    rejected: List[ValueCandidate] = list(c for c in candidates if c.signal_level == SIGNAL_REJECTED)
+    rejected: List[ValueCandidate] = [c for c in candidates if c.signal_level == SIGNAL_REJECTED]
+    non_rejected: List[ValueCandidate] = [c for c in candidates if c.signal_level != SIGNAL_REJECTED]
 
-    for level, bucket_name in ((SIGNAL_HIGH, "high"), (SIGNAL_MEDIUM, "medium"), (SIGNAL_LOW, "low")):
-        level_candidates = [c for c in candidates if c.signal_level == level]
-        kept, bumped = _dedupe_per_event(level_candidates)
-        rejected.extend(bumped)
+    kept, bumped = _dedupe_per_event(non_rejected)
+    rejected.extend(bumped)
 
-        ranked = sorted(kept, key=lambda c: c.ranking_score, reverse=True)
-        top = ranked[:MAX_SIGNALS_PER_LEVEL]
-        overflow = ranked[MAX_SIGNALS_PER_LEVEL:]
-        for extra in overflow:
-            extra.rejection_reasons.append(
-                f"Лимит в {MAX_SIGNALS_PER_LEVEL} сигналов уровня {level} уже заполнен более сильными сигналами"
-            )
-            rejected.append(extra)
+    ranked = sorted(kept, key=_sort_key)
+    top = ranked[:MAX_TOTAL_SIGNALS]
+    overflow = ranked[MAX_TOTAL_SIGNALS:]
+    for extra in overflow:
+        extra.rejection_reasons.append(
+            f"Не попал в общий топ-{MAX_TOTAL_SIGNALS} сигналов — есть более сильные "
+            f"сигналы по другим событиям (приоритет HIGH \u2192 MEDIUM \u2192 LOW)"
+        )
+        rejected.append(extra)
 
-        # Cross-level de-duplication: an event already shown at a higher
-        # level must not also show a second signal on the SAME market, and
-        # a second signal on a genuinely DIFFERENT market only survives
-        # when both the already-shown and the new signal are MEDIUM or
-        # HIGH -- a LOW never gets a second slot on an event that already
-        # has a stronger signal showing, even on a different market.
-        already_shown_by_event: Dict[str, List[ValueCandidate]] = {}
-        for c in result.main:
-            already_shown_by_event.setdefault(c.event_id, []).append(c)
+    closest_rejected = sorted(
+        (c for c in candidates if c.signal_level == SIGNAL_REJECTED),
+        key=lambda c: c.ranking_score,
+        reverse=True,
+    )[:MAX_TOTAL_SIGNALS]
 
-        final_top = []
-        for c in top:
-            existing = already_shown_by_event.get(c.event_id, [])
-            same_market_conflict = any(e.market_type == c.market_type for e in existing)
-            blocked = False
-            if same_market_conflict:
-                c.rejection_reasons.append(
-                    "По этому событию и рынку уже показан сигнал более высокого уровня"
-                )
-                blocked = True
-            elif existing:
-                # Different market(s) already shown -- only allowed to add
-                # this one if it and every already-shown signal on this
-                # event are both MEDIUM or HIGH.
-                both_strong = c.signal_level in _MULTI_MARKET_ELIGIBLE_LEVELS and all(
-                    e.signal_level in _MULTI_MARKET_ELIGIBLE_LEVELS for e in existing
-                )
-                if not both_strong:
-                    c.rejection_reasons.append(
-                        "По этому событию уже показан сигнал на другом рынке; второй слот "
-                        "разрешён только когда оба сигнала уровня MEDIUM или HIGH"
-                    )
-                    blocked = True
-            if blocked:
-                rejected.append(c)
-            else:
-                final_top.append(c)
-        setattr(result, bucket_name, final_top)
-
-    return ValueSelectionResult(high=result.high, medium=result.medium, low=result.low, rejected=rejected)
+    return ValueSelectionResult(top_signals=top, rejected=rejected, closest_rejected=closest_rejected)
