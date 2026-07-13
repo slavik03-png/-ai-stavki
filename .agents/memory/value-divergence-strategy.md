@@ -29,3 +29,36 @@ strategy (only h2h/double_chance/draw_no_bet/totals are used) because
 `tracking/settlement.py` has no handicap-settlement function — a spreads
 recommendation could never be graded. Add a settlement function first if
 spreads support is ever requested.
+
+## Ranked HIGH/MEDIUM/LOW/REJECTED tiering (replaced the binary pass/reject filter)
+
+All tier thresholds live in one place (`ai_predictions/value_config.py`) —
+never hard-code an EV/edge/bookmaker-count number anywhere else.
+
+- **Pre-dedup bookmaker counts need their own helper.** `matching.py`
+  already dedupes bookmaker rows before `value_engine.py` ever sees them,
+  so "how many bookmaker rows existed before dedup" (needed for a
+  duplicate-quote diagnostic) can't be recovered downstream — it must be
+  computed on the raw validated rows and threaded through explicitly,
+  keyed by grouping point (not signed point) so spreads still line up.
+
+- **A single high price must not dominate the ranking score.** Use
+  `log2(bookmaker_count)` (diminishing returns) plus a dispersion penalty
+  and a flat outlier penalty, never bookmaker_count or price directly —
+  otherwise heavier market coverage or one big number always wins
+  regardless of real EV/edge quality.
+
+- **Outlier demotion cascades exactly one level per flag**
+  (HIGH→MEDIUM→MEDIUM→LOW→REJECTED), applied *after* tier classification,
+  not baked into the tier thresholds themselves — keeps the two concerns
+  (divergence strength vs. "is this one quote suspicious") independently
+  testable.
+
+- **Cross-level de-dup bug found via testing:** a naive "already shown
+  (event_id, market_type) pairs" check only blocks same-market duplicates
+  — it does NOT enforce "a lower-tier signal never gets a second slot on
+  an event that already has a stronger signal on a different market."
+  That rule must compare the new candidate's tier against *every*
+  already-shown candidate on that event, not just check market_type
+  equality. Any future selector/ranking dedup logic should build the
+  "already shown" set as candidates-per-event, not a flat tuple set.
