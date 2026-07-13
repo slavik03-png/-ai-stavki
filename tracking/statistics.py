@@ -29,8 +29,36 @@ from tracking.models import (
 
 #: Below this many decisive (win/loss) results, statistics are still
 #: computed but the report must warn that the sample is too small to draw
-#: conclusions from.
+#: conclusions from. Kept for any code still using the single-threshold
+#: check; the ranked HIGH/MEDIUM/LOW system uses the three-tier wording
+#: below (sample_size_note) instead.
 MIN_RELIABLE_SAMPLE = 20
+
+#: Three-tier sample-size wording for the ranked signal system (settled
+#: count, not decisive count -- pushes/voids still tell you the sample
+#: exists even though they don't resolve win/loss).
+VERY_SMALL_SAMPLE_MAX = 29     # < 30 settled: "very small sample"
+PRELIMINARY_SAMPLE_MAX = 99    # 30-99 settled: "preliminary"
+                                # 100+ settled: "meaningful but not conclusive"
+
+
+def sample_size_note(settled_count: int) -> str:
+    """Never claims profitability on a small sample -- always describes
+    the sample-size ceiling honestly, even at 100+."""
+    if settled_count <= VERY_SMALL_SAMPLE_MAX:
+        return (
+            f"⚠️ Очень маленькая выборка ({settled_count} рассчитанных) — "
+            "статистике пока нельзя доверять вообще."
+        )
+    if settled_count <= PRELIMINARY_SAMPLE_MAX:
+        return (
+            f"⚠️ Предварительная выборка ({settled_count} рассчитанных) — "
+            "тенденция только начинает вырисовываться, делать выводы ещё рано."
+        )
+    return (
+        f"Значимая выборка ({settled_count} рассчитанных), но не окончательная — "
+        "прошлые результаты всё равно не гарантируют будущую прибыль."
+    )
 
 
 def _profit(status: str, odds: float) -> float:
@@ -212,6 +240,19 @@ def by_confidence_level(predictions: Sequence) -> Dict[str, Stats]:
 
 def by_model_version(predictions: Sequence) -> Dict[str, Stats]:
     return group_by(predictions, lambda r: r["model_version"])
+
+
+def by_signal_level(predictions: Sequence) -> Dict[str, Stats]:
+    """Per-level breakdown for the ranked HIGH/MEDIUM/LOW/REJECTED value
+    system. REJECTED candidates are tracked too (Step 7) so their
+    settled performance is measurable, even though they were never
+    surfaced to the user as an actionable signal."""
+    def _key(r):
+        try:
+            return r["signal_level"]
+        except (KeyError, IndexError):
+            return None
+    return group_by(predictions, _key)
 
 
 def _odds_interval(odds: float) -> str:

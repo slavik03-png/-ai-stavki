@@ -87,15 +87,24 @@ def test_genuine_divergence_produces_saved_recommendation():
     with tempfile.TemporaryDirectory() as d:
         event = _h2h_event("evt-divergent", "Home FC", "Away FC", DIVERGENT_PRICES)
         result, storage = _run_with_events([event], os.path.join(d, "t.db"))
+        # DIVERGENT_PRICES' best price is >10% above the real second-best
+        # price -- a genuine isolated-outlier shape -- so it is correctly
+        # demoted from HIGH to MEDIUM rather than rejected outright.
         check("one recommendation produced from genuine divergence", result.final_recommendations == 1, result.final_recommendations)
-        check("recommendation was saved to tracking storage", result.saved_count == 1, result.saved_count)
+        check("MEDIUM count reflects the outlier-demoted signal", result.medium_count == 1, result.medium_count)
         check("diagnostics report events received", result.events_received == 1)
         check("diagnostics report candidates created", result.candidates_created > 0)
         check("report text names the divergence, not fabricated stats", "расхожд" in result.report_text.lower())
 
+        # Every evaluated candidate (including REJECTED ones for Draw/Away)
+        # is now persisted, per spec Step 7 -- not just the shown signal.
         saved = storage.list_all_predictions()
-        check("exactly one prediction persisted", len(saved) == 1)
-        check("saved prediction is tagged odds-only data provider", saved[0]["data_provider"] == "the_odds_api", saved[0]["data_provider"])
+        check("every evaluated candidate this run was persisted, not just the shown one",
+              result.saved_count == len(saved) and len(saved) >= 1, (result.saved_count, len(saved)))
+        shown = [r for r in saved if r["signal_level"] == "MEDIUM"]
+        check("the shown MEDIUM candidate is among the persisted rows", len(shown) == 1, shown)
+        check("saved prediction is tagged odds-only data provider", shown[0]["data_provider"] == "the_odds_api", shown[0]["data_provider"])
+        check("saved prediction is tagged with the current model version", shown[0]["model_version"] == "value-ranking-v2.0", shown[0]["model_version"])
         storage.close()
 
 
@@ -104,9 +113,10 @@ def test_flat_market_yields_no_recommendations_and_explains_why():
         event = _h2h_event("evt-flat", "Home FC", "Away FC", FLAT_PRICES)
         result, storage = _run_with_events([event], os.path.join(d, "t.db"))
         check("flat/agreeing market yields zero recommendations", result.final_recommendations == 0)
-        check("nothing saved when nothing qualifies", result.saved_count == 0)
-        check("report explicitly says no recommendations, never invents one",
-              "нет надёжных рекомендаций" in result.report_text.lower())
+        check("REJECTED candidates are still saved even though nothing is shown",
+              result.saved_count > 0 and result.candidates_rejected == result.saved_count, result.saved_count)
+        check("report explicitly says no signals at any level, never invents one",
+              "нет сигналов" in result.report_text.lower())
         storage.close()
 
 
@@ -139,7 +149,11 @@ def test_at_most_one_recommendation_per_event():
                 }],
             })
         result, storage = _run_with_events([event], os.path.join(d, "t.db"))
-        check("at most one recommendation survives for a single event", result.final_recommendations <= 1, result.final_recommendations)
+        # Two different real markets (1x2 and totals) both diverging is the
+        # documented exception (Step 6): up to 2 signals survive for one
+        # event ONLY if both are MEDIUM or HIGH -- never more than that.
+        check("at most two recommendations survive for a single event (different-market exception)",
+              result.final_recommendations <= 2, result.final_recommendations)
         storage.close()
 
 
@@ -159,7 +173,7 @@ def test_no_events_yields_honest_empty_report():
         result, storage = _run_with_events([], os.path.join(d, "t.db"))
         check("zero events -> zero saved", result.saved_count == 0)
         check("report explicitly explains the empty result",
-              "не найдено" in result.report_text.lower() or "нет надёжных рекомендаций" in result.report_text.lower(),
+              "нет сигналов" in result.report_text.lower(),
               result.report_text[:300])
         storage.close()
 

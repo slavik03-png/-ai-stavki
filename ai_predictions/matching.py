@@ -240,6 +240,23 @@ def dedupe_bookmaker_rows(rows: List[RawRow], stats: ValidationStats) -> List[Ra
     return list(best.values())
 
 
+def raw_bookmaker_row_counts(rows: List[RawRow]) -> Dict[Tuple[Any, ...], int]:
+    """Counts real quote rows per (event_key, market, point, canonical
+    outcome) BEFORE bookmaker-level deduplication -- used only as a Step 3
+    confidence-safeguard diagnostic ("total bookmaker count before
+    deduplication"), never for the actual matching/grouping/value math,
+    which always runs on deduped rows. Call with the *validated* (not yet
+    deduped) row list."""
+    counts: Dict[Tuple[Any, ...], int] = {}
+    for row in rows:
+        canonical = canonical_outcome(row.market, row.outcome_raw, row.home_team, row.away_team)
+        if canonical is None:
+            continue
+        key = (row.event_key, row.market, _grouping_point(row.market, row.point), canonical)
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
 def _grouping_point(market: str, point: Optional[float]) -> Optional[float]:
     """The key used to group rows into one market instance. For two-sided
     handicaps ("spreads") the API quotes the same real line from both

@@ -81,10 +81,15 @@ class TrackingStorage:
                     final_score TEXT,
                     first_half_score TEXT,
                     settled_at TEXT,
-                    settlement_explanation TEXT
+                    settlement_explanation TEXT,
+                    signal_level TEXT,
+                    ranking_score REAL,
+                    outlier_warning INTEGER NOT NULL DEFAULT 0,
+                    rejection_reason TEXT
                 )
                 """
             )
+            self._add_missing_columns()
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS event_results (
@@ -126,6 +131,23 @@ class TrackingStorage:
                 "CREATE INDEX IF NOT EXISTS idx_predictions_event ON predictions(event_id)"
             )
 
+    def _add_missing_columns(self) -> None:
+        """Additive-only migration for databases created before the ranked
+        HIGH/MEDIUM/LOW/REJECTED signal system existed: adds any missing
+        columns with ALTER TABLE ADD COLUMN. Never drops or renames a
+        column, never touches existing rows -- old rows simply read back
+        with NULL/0 defaults for the new fields."""
+        existing = {row["name"] for row in self._conn.execute("PRAGMA table_info(predictions)").fetchall()}
+        needed = {
+            "signal_level": "TEXT",
+            "ranking_score": "REAL",
+            "outlier_warning": "INTEGER NOT NULL DEFAULT 0",
+            "rejection_reason": "TEXT",
+        }
+        for column, coltype in needed.items():
+            if column not in existing:
+                self._conn.execute(f"ALTER TABLE predictions ADD COLUMN {column} {coltype}")
+
     def close(self) -> None:
         self._conn.close()
 
@@ -138,6 +160,7 @@ class TrackingStorage:
             prediction.created_at = utc_now_iso()
         row = asdict(prediction)
         row["dedup_key"] = prediction.dedup_key
+        row["outlier_warning"] = 1 if prediction.outlier_warning else 0
         columns = [
             "prediction_id", "dedup_key", "created_at", "sport", "country", "league",
             "event_id", "event_start_time", "home_team", "away_team", "market_type",
@@ -145,6 +168,7 @@ class TrackingStorage:
             "confidence_score", "confidence_level", "recommendation_group", "explanation",
             "data_provider", "model_version", "status", "final_score", "first_half_score",
             "settled_at", "settlement_explanation",
+            "signal_level", "ranking_score", "outlier_warning", "rejection_reason",
         ]
         placeholders = ", ".join(f":{c}" for c in columns)
         sql = f"INSERT INTO predictions ({', '.join(columns)}) VALUES ({placeholders})"

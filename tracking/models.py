@@ -58,6 +58,13 @@ DECISIVE_STATUSES = {STATUS_WON, STATUS_LOST, STATUS_HALF_WON, STATUS_HALF_LOST}
 
 RECOMMENDATION_GROUPS = {"main", "alternative", "high_risk", "avoid"}
 
+#: Ranked value-signal levels (ai_predictions/value_config.py is the
+#: single source of truth for the level names; duplicated here as plain
+#: strings, not an import, so tracking/ has no dependency on
+#: ai_predictions/). None means "not produced by the ranked signal
+#: system" -- e.g. rows from the older statistics-based pipeline.
+SIGNAL_LEVELS = {"HIGH", "MEDIUM", "LOW", "REJECTED"}
+
 
 def new_prediction_id() -> str:
     return str(uuid.uuid4())
@@ -102,6 +109,14 @@ class Prediction:
     settled_at: Optional[str] = None
     settlement_explanation: Optional[str] = None
 
+    # -- ranked HIGH/MEDIUM/LOW/REJECTED signal system (optional, backward
+    #    compatible: rows from the older statistics-based pipeline simply
+    #    leave these at their defaults). --
+    signal_level: Optional[str] = None
+    ranking_score: Optional[float] = None
+    outlier_warning: bool = False
+    rejection_reason: Optional[str] = None
+
     def __post_init__(self) -> None:
         if self.recommendation_group not in RECOMMENDATION_GROUPS:
             raise ValueError(
@@ -110,6 +125,10 @@ class Prediction:
             )
         if self.status not in ALL_STATUSES:
             raise ValueError(f"invalid status {self.status!r}")
+        if self.signal_level is not None and self.signal_level not in SIGNAL_LEVELS:
+            raise ValueError(
+                f"invalid signal_level {self.signal_level!r}, must be one of {sorted(SIGNAL_LEVELS)} or None"
+            )
 
     @property
     def dedup_key(self) -> str:

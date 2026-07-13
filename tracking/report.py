@@ -13,7 +13,7 @@ from typing import List, Sequence
 
 from tracking import statistics as stats_mod
 from tracking.models import STATUS_PENDING
-from tracking.statistics import MIN_RELIABLE_SAMPLE, Stats
+from tracking.statistics import MIN_RELIABLE_SAMPLE, Stats, sample_size_note
 
 FINAL_DISCLAIMER = (
     "Статистика отражает прошлые результаты и не гарантирует прибыль или "
@@ -67,6 +67,35 @@ def _breakdown_block(title: str, breakdown) -> List[str]:
     return lines
 
 
+#: Fixed, documented order for the ranked-signal breakdown -- never
+#: alphabetical, since "REJECTED" would otherwise sort before "HIGH".
+_SIGNAL_LEVEL_ORDER = ["HIGH", "MEDIUM", "LOW", "REJECTED", None]
+
+
+def _signal_level_block(by_level: dict) -> List[str]:
+    lines = ["## 10. Результаты по уровню сигнала (HIGH/MEDIUM/LOW/REJECTED)"]
+    if not by_level:
+        lines.append("  Нет данных для этого разреза.")
+        return lines
+    label_ru = {"HIGH": "🔥 HIGH", "MEDIUM": "🟡 MEDIUM", "LOW": "⚪ LOW",
+                "REJECTED": "Отклонено", None: "Без уровня (старая модель)"}
+    for level in _SIGNAL_LEVEL_ORDER:
+        s = by_level.get(level)
+        if s is None:
+            continue
+        lines.append(
+            f"  {label_ru.get(level, level)}: рассчитано {s.settled}, win rate {_fmt_pct(s.win_rate)}, "
+            f"ROI {_fmt_pct(s.roi)}, средний коэф. {_fmt_num(s.average_odds, 3)}, "
+            f"прибыль {_fmt_num(s.flat_stake_profit, 2)} юнит(ов)"
+        )
+        lines.append(f"    {sample_size_note(s.settled)}")
+    # Any keys not covered by the fixed order (defensive, should not happen).
+    for level, s in by_level.items():
+        if level not in _SIGNAL_LEVEL_ORDER:
+            lines.append(f"  {level}: рассчитано {s.settled}, ROI {_fmt_pct(s.roi)}")
+    return lines
+
+
 def _strongest_weakest_markets(by_market: dict, min_settled: int = 3) -> "tuple[list, list]":
     eligible = [(name, s) for name, s in by_market.items() if s.settled >= min_settled and s.roi is not None]
     strongest = sorted(eligible, key=lambda kv: kv[1].roi, reverse=True)[:3]
@@ -85,6 +114,7 @@ def render_report_ru(
     by_market = stats_mod.by_market_type(predictions)
     by_confidence = stats_mod.by_confidence_level(predictions)
     by_group = stats_mod.by_recommendation_group(predictions)
+    by_level = stats_mod.by_signal_level(predictions)
     last_7 = stats_mod.last_n_days(predictions, 7, now)
     last_30 = stats_mod.last_n_days(predictions, 30, now)
 
@@ -135,7 +165,10 @@ def render_report_ru(
     lines.extend(_overall_block("## 8. Последние 30 дней", last_30))
     lines.append("")
 
-    lines.append("## 9. Итоговое предупреждение")
+    lines.extend(_signal_level_block(by_level))
+    lines.append("")
+
+    lines.append("## 11. Итоговое предупреждение")
     lines.append(FINAL_DISCLAIMER)
 
     return "\n".join(lines)

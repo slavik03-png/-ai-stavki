@@ -1,12 +1,15 @@
 """
-End-to-end orchestration for the cross-bookmaker value-detection strategy:
+End-to-end orchestration for the ranked HIGH/MEDIUM/LOW/REJECTED
+cross-bookmaker value-detection strategy:
 
   fetch real odds -> 36h window filter -> extract/validate/dedupe/group
   real bookmaker rows (ai_predictions/matching.py) -> build real
-  ValueCandidates from cross-bookmaker price divergence
-  (ai_predictions/value_engine.py) -> select up to 5, one per event ->
-  persist to tracking (dedup-safe) -> render the Russian report text with
-  full pipeline diagnostics.
+  ValueCandidates with a signal_level + ranking_score from cross-bookmaker
+  price divergence (ai_predictions/value_engine.py) -> select up to 5 per
+  level, one signal per event with limited exceptions
+  (ai_predictions/value_selector.py) -> persist EVERY evaluated candidate
+  (including REJECTED ones) to tracking, dedup-safe -> render the Russian
+  report text with full pipeline diagnostics.
 
 Deliberately does not call football/ or ApiFootballProvider at all: this
 strategy needs no team statistics. The API-Football integration
@@ -27,16 +30,21 @@ from ai_predictions.matching import (
     dedupe_bookmaker_rows,
     extract_rows,
     group_rows,
+    raw_bookmaker_row_counts,
     validate_rows,
 )
 from ai_predictions.odds_client import fetch_football_events
-from ai_predictions.value_engine import (
-    MIN_BOOKMAKERS,
-    ValueCandidate,
-    build_value_candidates_from_groups,
+from ai_predictions.value_config import (
+    LOW_MIN_BOOKMAKERS,
+    MODEL_VERSION,
+    SIGNAL_HIGH,
+    SIGNAL_LOW,
+    SIGNAL_MEDIUM,
+    SIGNAL_REJECTED,
 )
+from ai_predictions.value_engine import ValueCandidate, build_value_candidates_from_groups
 from ai_predictions.value_report import Diagnostics, compute_top_rejection_reasons, render_value_report
-from ai_predictions.value_selector import select_value_recommendations
+from ai_predictions.value_selector import ValueSelectionResult, select_value_recommendations
 from ai_predictions.window import filter_events_in_window
 from tracking.models import STATUS_PENDING, Prediction
 from tracking.storage import DuplicatePredictionError, TrackingStorage
@@ -49,12 +57,23 @@ MARKET_TYPE_DISPLAY_NAMES = {
     "spread": "Гандикап",
 }
 
+#: recommendation_group is a legacy tracking column (validated against a
+#: fixed set) reused here purely as a coarse bucket so existing
+#: statistics.by_recommendation_group breakdowns keep working; the
+#: authoritative ranked level lives in Prediction.signal_level.
+_LEVEL_TO_RECOMMENDATION_GROUP = {
+    SIGNAL_HIGH: "main",
+    SIGNAL_MEDIUM: "alternative",
+    SIGNAL_LOW: "high_risk",
+    SIGNAL_REJECTED: "avoid",
+}
 
-#: A confidence_level bucket derived purely from real, observable market
-#: agreement (bookmaker_count) -- explicitly NOT a statistical confidence
-#: claim about the match outcome, only about how many independent real
-#: bookmakers back the divergence.
+
 def _confidence_level(bookmaker_count: int) -> str:
+    """A confidence_level bucket derived purely from real, observable
+    market agreement (bookmaker_count) -- explicitly NOT a statistical
+    confidence claim about the match outcome, only about how many
+    independent real bookmakers back the divergence."""
     if bookmaker_count >= 6:
         return "высокое согласие рынка"
     if bookmaker_count >= 4:
@@ -76,41 +95,59 @@ class ValuePipelineResult:
     diagnostics: Optional[Diagnostics] = None
     debug_groups: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
+    high_count: int = 0
+    medium_count: int = 0
+    low_count: int = 0
 
 
 def _event_id(event: Dict[str, Any]) -> str:
     return str(event.get("id") or f"{event.get('_sport_key')}|{event.get('commence_time')}|{event.get('home_team')}|{event.get('away_team')}")
 
 
-def _save_recommendations(main: List[ValueCandidate], storage: TrackingStorage) -> "tuple[int, int]":
+def _candidate_to_prediction(candidate: ValueCandidate) -> Prediction:
+    outlier_flag = candidate.outlier_warning is not None
+    rejection_text = "; ".join(candidate.rejection_reasons) if candidate.rejection_reasons else None
+    return Prediction(
+        sport=candidate.sport,
+        country=candidate.country,
+        league=candidate.league,
+        event_id=candidate.event_id,
+        event_start_time=candidate.match_datetime,
+        home_team=candidate.home_team,
+        away_team=candidate.away_team,
+        market_type=candidate.market_type,
+        market_name=MARKET_TYPE_DISPLAY_NAMES.get(candidate.market_type, candidate.market_type),
+        selection=candidate.selection,
+        bookmaker_odds=candidate.best_price,
+        model_probability=candidate.consensus_probability,
+        confidence_score=round(max(0.0, min(100.0, candidate.edge * 100.0)), 1),
+        confidence_level=_confidence_level(candidate.unique_bookmaker_count),
+        recommendation_group=_LEVEL_TO_RECOMMENDATION_GROUP.get(candidate.signal_level, "avoid"),
+        explanation=(
+            f"Лучшая цена {candidate.best_price:.2f} у {candidate.best_bookmaker} против справедливой "
+            f"{candidate.fair_price:.2f} по {candidate.consensus_bookmaker_count} другим букмекерам "
+            f"(расхождение {candidate.edge:.3f}, всего {candidate.unique_bookmaker_count} букмекеров по исходу)."
+        ),
+        data_provider="the_odds_api",
+        model_version=MODEL_VERSION,
+        line=candidate.line,
+        status=STATUS_PENDING,
+        signal_level=candidate.signal_level,
+        ranking_score=candidate.ranking_score,
+        outlier_warning=outlier_flag,
+        rejection_reason=rejection_text,
+    )
+
+
+def _save_all_candidates(candidates: List[ValueCandidate], storage: TrackingStorage) -> "tuple[int, int]":
+    """Persists EVERY evaluated candidate this run -- HIGH, MEDIUM, LOW and
+    REJECTED alike -- so later statistics can measure each level's real
+    settled performance, not just the ones shown to the user. Never
+    overwrites an older model version's rows: dedup_key includes
+    model_version, so bumping MODEL_VERSION always creates fresh rows."""
     saved, duplicates = 0, 0
-    for candidate in main:
-        prediction = Prediction(
-            sport=candidate.sport,
-            country=candidate.country,
-            league=candidate.league,
-            event_id=candidate.event_id,
-            event_start_time=candidate.match_datetime,
-            home_team=candidate.home_team,
-            away_team=candidate.away_team,
-            market_type=candidate.market_type,
-            market_name=MARKET_TYPE_DISPLAY_NAMES.get(candidate.market_type, candidate.market_type),
-            selection=candidate.selection,
-            bookmaker_odds=candidate.best_price,
-            model_probability=candidate.consensus_probability,
-            confidence_score=round(max(0.0, min(100.0, candidate.edge * 100.0)), 1),
-            confidence_level=_confidence_level(candidate.bookmaker_count),
-            recommendation_group="main",
-            explanation=(
-                f"Лучшая цена {candidate.best_price:.2f} у {candidate.best_bookmaker} против справедливой "
-                f"{candidate.fair_price:.2f} по {candidate.consensus_bookmaker_count} другим букмекерам "
-                f"(расхождение {candidate.edge:.3f}, всего {candidate.bookmaker_count} букмекеров по исходу)."
-            ),
-            data_provider="the_odds_api",
-            model_version="value-divergence-v1.1",
-            line=candidate.line,
-            status=STATUS_PENDING,
-        )
+    for candidate in candidates:
+        prediction = _candidate_to_prediction(candidate)
         try:
             storage.save_prediction(prediction)
             saved += 1
@@ -168,6 +205,7 @@ def run_value_predictions(
             odds_errors.append(f"Ошибка обработки события {event_id}: {exc}")
 
     valid_rows = validate_rows(all_rows, stats)
+    raw_counts = raw_bookmaker_row_counts(valid_rows)
     deduped_rows = dedupe_bookmaker_rows(valid_rows, stats)
     groups = group_rows(deduped_rows)
 
@@ -181,11 +219,13 @@ def run_value_predictions(
             groups_2 += 1
         else:
             groups_3plus += 1
-        if max_bm >= MIN_BOOKMAKERS:
+        if max_bm >= LOW_MIN_BOOKMAKERS:
             markets_matched += 1
 
-    all_candidates = build_value_candidates_from_groups(groups)
+    all_candidates = build_value_candidates_from_groups(groups, raw_counts)
     result = select_value_recommendations(all_candidates)
+
+    outlier_warning_count = sum(1 for c in all_candidates if c.outlier_warning)
 
     diagnostics = Diagnostics(
         events_received=len(events),
@@ -205,6 +245,11 @@ def run_value_predictions(
         duplicate_bookmaker_rows=stats.duplicate_bookmaker_rows,
         unsupported_markets_seen=dict(stats.unsupported_markets_seen),
         top_rejection_reasons=compute_top_rejection_reasons(result.rejected),
+        high_count=len(result.high),
+        medium_count=len(result.medium),
+        low_count=len(result.low),
+        rejected_count=len(result.rejected),
+        outlier_warning_count=outlier_warning_count,
     )
 
     debug_groups: List[str] = []
@@ -213,7 +258,7 @@ def run_value_predictions(
 
     report_text = render_value_report(result, diagnostics)
 
-    saved, duplicates = _save_recommendations(result.main, storage)
+    saved, duplicates = _save_all_candidates(all_candidates, storage)
 
     if owns_storage:
         storage.close()
@@ -231,4 +276,7 @@ def run_value_predictions(
         diagnostics=diagnostics,
         debug_groups=debug_groups,
         errors=odds_errors,
+        high_count=len(result.high),
+        medium_count=len(result.medium),
+        low_count=len(result.low),
     )
