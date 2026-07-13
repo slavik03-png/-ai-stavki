@@ -62,3 +62,13 @@ never hard-code an EV/edge/bookmaker-count number anywhere else.
   already-shown candidate on that event, not just check market_type
   equality. Any future selector/ranking dedup logic should build the
   "already shown" set as candidates-per-event, not a flat tuple set.
+
+- **Selection policy superseded: global top-5, not per-level cap-of-5.**
+  The authoritative design (as of 2026-07-13) is: dedupe per event across
+  ALL tiers at once, then rank every surviving candidate GLOBALLY —
+  HIGH always before MEDIUM before LOW as the primary sort key (never
+  blended with score across tiers) — and keep only the top 5 total. If
+  zero qualify, surface the 5 REJECTED candidates with the highest
+  ranking_score (closest to a real threshold) instead of an empty report.
+  Do not regress to "up to 5 per level, 15 max" — that was the earlier,
+  now-replaced design.
