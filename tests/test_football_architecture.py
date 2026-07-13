@@ -66,6 +66,66 @@ def test_api_football_enforces_request_budget():
           isinstance(stat, Stat) and not stat.available and "лимит" in (stat.reason or "").lower())
 
 
+def test_api_football_sends_official_header_and_never_logs_key():
+    """Every request must carry the official x-apisports-key header with
+    exactly the configured key, and the key must never appear in a printed
+    URL/param -- only in the header dict."""
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        headers = {"x-ratelimit-requests-remaining": "97"}
+
+        def json(self):
+            return {"response": [], "errors": []}
+
+    class FakeSession:
+        def get(self, url, params=None, headers=None, timeout=None):
+            captured["url"] = url
+            captured["params"] = params
+            captured["headers"] = headers
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+    provider = ApiFootballProvider(api_key="secret-test-key-value", session=FakeSession())
+    provider.get_standings("Some League")
+
+    check("request uses the official x-apisports-key header",
+          captured.get("headers") == {"x-apisports-key": "secret-test-key-value"})
+    check("a timeout is always set on the request", isinstance(captured.get("timeout"), (int, float)) and captured["timeout"] > 0)
+    check("the API key is never placed in the URL or query params",
+          "secret-test-key-value" not in captured.get("url", "")
+          and "secret-test-key-value" not in str(captured.get("params", {})))
+
+
+def test_api_football_reads_remaining_quota_header():
+    class FakeResponse:
+        status_code = 200
+        headers = {"x-ratelimit-requests-remaining": "42"}
+
+        def json(self):
+            return {"response": [{"team": {"id": 1}}], "errors": []}
+
+    class FakeSession:
+        def get(self, url, params=None, headers=None, timeout=None):
+            return FakeResponse()
+
+    provider = ApiFootballProvider(api_key="k", session=FakeSession())
+    provider.get_upcoming_matches("Some Team")
+    check("remaining quota is parsed from the response header", provider.remaining_quota == 42)
+
+
+def test_ai_predictions_pipeline_reads_football_api_key_from_correct_env_var():
+    """The football statistics pipeline (ai_predictions/pipeline.py) must
+    read exactly os.getenv('FOOTBALL_API_KEY') -- the real configured
+    Replit secret name -- never a renamed/alternate variable."""
+    import inspect
+    import ai_predictions.pipeline as pipeline_module
+    source = inspect.getsource(pipeline_module.run_ai_predictions)
+    check("run_ai_predictions reads FOOTBALL_API_KEY (not a renamed variable)",
+          'os.getenv("FOOTBALL_API_KEY")' in source, source)
+
+
 def test_stat_contract():
     ok = Stat.ok(42)
     missing = Stat.missing("no data")
@@ -100,6 +160,9 @@ def run():
     test_api_football_template_implements_full_interface()
     test_api_football_degrades_safely_without_key()
     test_api_football_enforces_request_budget()
+    test_api_football_sends_official_header_and_never_logs_key()
+    test_api_football_reads_remaining_quota_header()
+    test_ai_predictions_pipeline_reads_football_api_key_from_correct_env_var()
     test_stat_contract()
     test_all_mock_provider_methods_return_stat()
 
