@@ -67,10 +67,17 @@ cache: Dict[str, Dict[str, Any]] = {}
 cache_locks: Dict[str, asyncio.Lock] = {prefix: asyncio.Lock() for prefix in CACHE_LABELS}
 last_known_credits: Optional[int] = None
 
-# ai_predictions_cache = {"message": str, "timestamp": float} -- separate
-# from the odds cache above (different prefix namespace, different lock).
+# ai_predictions_cache = {"messages": List[str], "timestamp": float} --
+# separate from the odds cache above (different prefix namespace,
+# different lock). Holds only the concise, user-facing signal messages.
 ai_predictions_cache: Optional[Dict[str, Any]] = None
 ai_predictions_lock = asyncio.Lock()
+
+# Latest run's technical diagnostics, shown only via the "ℹ️ Статус"
+# button / /status command -- never sent as part of the normal
+# prediction message. Kept separately so /status can report the last
+# real run even after the 30-minute prediction cache itself expires.
+ai_predictions_last_diagnostics: Optional[Dict[str, Any]] = None
 
 
 def main_keyboard() -> InlineKeyboardMarkup:
@@ -200,6 +207,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_keyboard())
 
 
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/status -- same technical diagnostics as the 'ℹ️ Статус' button."""
+    await update.message.reply_text(build_status_text(), reply_markup=main_keyboard())
+
+
 async def send_cached(query, prefix: str) -> None:
     entry = cache[prefix]
     await query.message.reply_text(
@@ -211,8 +223,19 @@ async def send_cached(query, prefix: str) -> None:
         await query.message.reply_document(document=f, filename=os.path.basename(entry["csv_path"]))
 
 
+async def _send_cached_predictions(query) -> None:
+    messages = ai_predictions_cache["messages"]
+    await query.message.reply_text(
+        "🗄 Прогноз из кэша (не старше 30 минут), новый запрос не выполнялся.\n\n"
+        + messages[0],
+        reply_markup=main_keyboard(),
+    )
+    for extra in messages[1:]:
+        await query.message.reply_text(extra, reply_markup=main_keyboard())
+
+
 async def handle_ai_predictions(query) -> None:
-    global ai_predictions_cache
+    global ai_predictions_cache, ai_predictions_last_diagnostics
 
     if not ODDS_API_KEY:
         await query.message.reply_text(
@@ -223,11 +246,7 @@ async def handle_ai_predictions(query) -> None:
 
     now_ts = datetime.now(timezone.utc).timestamp()
     if ai_predictions_cache and (now_ts - ai_predictions_cache["timestamp"]) < CACHE_TTL_SECONDS:
-        await query.message.reply_text(
-            "🗄 Прогноз из кэша (не старше 30 минут), новый запрос не выполнялся.\n\n"
-            + ai_predictions_cache["message"],
-            reply_markup=main_keyboard(),
-        )
+        await _send_cached_predictions(query)
         return
 
     if ai_predictions_lock.locked():
@@ -240,11 +259,7 @@ async def handle_ai_predictions(query) -> None:
     async with ai_predictions_lock:
         now_ts = datetime.now(timezone.utc).timestamp()
         if ai_predictions_cache and (now_ts - ai_predictions_cache["timestamp"]) < CACHE_TTL_SECONDS:
-            await query.message.reply_text(
-                "🗄 Прогноз из кэша (не старше 30 минут), новый запрос не выполнялся.\n\n"
-                + ai_predictions_cache["message"],
-                reply_markup=main_keyboard(),
-            )
+            await _send_cached_predictions(query)
             return
 
         if last_known_credits is not None and last_known_credits < MIN_CREDITS_FOR_AI_PREDICTIONS:
@@ -262,16 +277,68 @@ async def handle_ai_predictions(query) -> None:
         )
         try:
             result = await asyncio.to_thread(run_value_predictions)
+            messages = result.telegram_messages or ["На ближайшие 36 часов подходящих сигналов не найдено."]
             ai_predictions_cache = {
-                "message": result.report_text,
+                "messages": messages,
                 "timestamp": datetime.now(timezone.utc).timestamp(),
             }
-            await query.message.reply_text(result.report_text, reply_markup=main_keyboard())
-            if result.errors:
-                error_preview = "\n".join(result.errors[:5])
-                await query.message.reply_text(f"⚠️ Часть данных получить не удалось:\n{error_preview}")
+            # Full technical diagnostics (discovery, validation counts, API
+            # errors, etc.) are kept only for /status -- never sent here.
+            ai_predictions_last_diagnostics = {
+                "diagnostics": result.diagnostics,
+                "api_error_summary": result.api_error_summary,
+                "high_count": result.high_count,
+                "medium_count": result.medium_count,
+                "low_count": result.low_count,
+                "timestamp": datetime.now(timezone.utc).timestamp(),
+            }
+            for message in messages:
+                await query.message.reply_text(message, reply_markup=main_keyboard())
         except Exception as e:
             await query.message.reply_text(f"❌ Ошибка при формировании прогнозов ИИ: {e}", reply_markup=main_keyboard())
+
+
+def build_status_text() -> str:
+    """All technical/diagnostic information lives here -- the normal
+    prediction message never shows any of this (see
+    render_telegram_signals_message)."""
+    ok_bot = "✅" if TELEGRAM_BOT_TOKEN else "❌"
+    ok_odds = "✅" if ODDS_API_KEY else "❌"
+    ok_football = "✅" if FOOTBALL_API_KEY else "❌"
+    credits_text = str(last_known_credits) if last_known_credits is not None else "неизвестно (ещё не было запросов)"
+    ai_predictions_status = "нет данных" if not ai_predictions_cache else "есть (обновится в течение 30 минут)"
+
+    lines = [
+        "ℹ️ Статус AI Ставки",
+        "",
+        f"Telegram token: {ok_bot}",
+        f"The Odds API key: {ok_odds}",
+        f"API-Football key: {ok_football}",
+        f"Осталось кредитов The Odds API: {credits_text}",
+        "",
+        "Кэш (хранится 30 минут):",
+        cache_status_lines(),
+        f"{CACHE_LABELS_AI_PREDICTIONS}: {ai_predictions_status}",
+    ]
+
+    if ai_predictions_last_diagnostics:
+        diag = ai_predictions_last_diagnostics.get("diagnostics")
+        lines.append("")
+        lines.append("Прогнозы ИИ — последний запуск:")
+        if diag is not None:
+            lines.append(f"Турниров обнаружено: {len(diag.sports_discovered)}")
+            lines.append(f"Турниров успешно опрошено: {len(diag.sports_queried)}")
+            lines.append(f"Событий в окне 36ч: {diag.events_in_window}")
+        lines.append(
+            f"Сигналов: HIGH — {ai_predictions_last_diagnostics.get('high_count', 0)}, "
+            f"MEDIUM — {ai_predictions_last_diagnostics.get('medium_count', 0)}, "
+            f"LOW — {ai_predictions_last_diagnostics.get('low_count', 0)}"
+        )
+        error_summary = ai_predictions_last_diagnostics.get("api_error_summary")
+        if error_summary:
+            lines.append(error_summary)
+
+    return "\n".join(lines)
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -280,22 +347,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.answer()
 
     if query.data == "status":
-        ok_bot = "✅" if TELEGRAM_BOT_TOKEN else "❌"
-        ok_odds = "✅" if ODDS_API_KEY else "❌"
-        ok_football = "✅" if FOOTBALL_API_KEY else "❌"
-        credits_text = str(last_known_credits) if last_known_credits is not None else "неизвестно (ещё не было запросов)"
-        ai_predictions_status = "нет данных" if not ai_predictions_cache else "есть (обновится в течение 30 минут)"
-        text = (
-            "ℹ️ Статус AI Ставки\n\n"
-            f"Telegram token: {ok_bot}\n"
-            f"The Odds API key: {ok_odds}\n"
-            f"API-Football key: {ok_football}\n"
-            f"Осталось кредитов The Odds API: {credits_text}\n\n"
-            "Кэш (хранится 30 минут):\n"
-            f"{cache_status_lines()}\n"
-            f"{CACHE_LABELS_AI_PREDICTIONS}: {ai_predictions_status}"
-        )
-        await query.message.reply_text(text, reply_markup=main_keyboard())
+        await query.message.reply_text(build_status_text(), reply_markup=main_keyboard())
         return
 
     if query.data == AI_PREDICTIONS_PREFIX:
@@ -372,6 +424,7 @@ def main() -> None:
         raise RuntimeError("Нет переменной TELEGRAM_BOT_TOKEN")
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CallbackQueryHandler(handle_callback))
     print("AI Ставки Bot запущен")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

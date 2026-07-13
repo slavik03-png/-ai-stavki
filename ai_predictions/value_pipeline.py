@@ -46,7 +46,13 @@ from ai_predictions.value_config import (
     SIGNAL_REJECTED,
 )
 from ai_predictions.value_engine import ValueCandidate, build_value_candidates_from_groups
-from ai_predictions.value_report import Diagnostics, compute_top_rejection_reasons, render_value_report
+from ai_predictions.value_report import (
+    Diagnostics,
+    compute_top_rejection_reasons,
+    render_telegram_signals_message,
+    render_value_report,
+    summarize_api_errors_ru,
+)
 from ai_predictions.value_selector import ValueSelectionResult, select_value_recommendations
 from ai_predictions.window import filter_events_in_window
 from tracking.models import STATUS_PENDING, Prediction
@@ -95,6 +101,15 @@ class ValuePipelineResult:
     final_recommendations: int
     saved_count: int
     duplicate_count: int
+    #: Concise, Russian, non-technical message(s) for the "🤖 Прогнозы ИИ"
+    #: button -- one or more chunks, never exceeding Telegram's message
+    #: length limit. Contains only the ranked signal cards + a short count
+    #: summary; all raw diagnostics stay in report_text for /status.
+    telegram_messages: List[str] = field(default_factory=list)
+    #: One short Russian line summarizing any per-competition API errors
+    #: (e.g. "Некоторые турниры недоступны: HTTP 401 — 24 турнира."), for
+    #: /status only. None when nothing failed.
+    api_error_summary: Optional[str] = None
     diagnostics: Optional[Diagnostics] = None
     debug_groups: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
@@ -283,6 +298,15 @@ def run_value_predictions(
         debug_groups = _debug_group_lines(groups)
 
     report_text = render_value_report(result, diagnostics)
+    telegram_messages = render_telegram_signals_message(result, diagnostics)
+    # Only real fetch failures count as "API errors" here -- normal
+    # discovery skips (inactive competition, outrights-only market) are
+    # expected filtering, not an error, and must never be aggregated as
+    # one. odds_errors already carries exactly one entry per genuinely
+    # failed competition (see fetch_football_events), so sports_failed
+    # (a same-source lookup keyed by sport, used only for sports_queried)
+    # is deliberately NOT also passed here to avoid double-counting.
+    api_error_summary = summarize_api_errors_ru(odds_errors, {})
 
     saved, duplicates = _save_all_candidates(all_candidates, storage)
 
@@ -299,6 +323,8 @@ def run_value_predictions(
         final_recommendations=len(result.top_signals),
         saved_count=saved,
         duplicate_count=duplicates,
+        telegram_messages=telegram_messages,
+        api_error_summary=api_error_summary,
         diagnostics=diagnostics,
         debug_groups=debug_groups,
         errors=odds_errors,

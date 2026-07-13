@@ -7,9 +7,10 @@ market divergence instead of a statistics-based confidence score.
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from ai_predictions.value_config import SIGNAL_LABELS
 from ai_predictions.value_engine import ValueCandidate
@@ -22,8 +23,23 @@ MARKET_DISPLAY_NAMES = {
     "double_chance": "Двойной шанс",
     "draw_no_bet": "Без ничьей",
     "total_goals": "Тотал голов",
-    "spread": "Гандикап",
+    "spread": "Фора",
 }
+
+#: Concise Telegram card labels for the same market types -- kept as a
+#: separate dict so the full diagnostics report's existing wording never
+#: changes (avoids breaking tests/test_ai_predictions_value_report.py's
+#: existing expectations), while the compact user-facing card can use its
+#: own short label.
+TELEGRAM_MARKET_LABELS = MARKET_DISPLAY_NAMES
+
+#: Telegram's own hard message-length limit is 4096 characters; stay well
+#: under it so a long card list never gets rejected by the API.
+TELEGRAM_MAX_CHARS = 3500
+
+_LOW_RISK_WARNING = (
+    "⚠️ Экспериментальный сигнал. Риск высокий. Не является основной рекомендацией."
+)
 
 _NEVER_WORDS_NOTE = (
     "Ни один сигнал не является «безопасной», «гарантированной» или «уверенной» ставкой — "
@@ -40,6 +56,34 @@ def _fmt_local_time(iso_time: str) -> str:
     if dt is None:
         return iso_time
     return format_display_time(dt)
+
+
+def _fmt_line_ru(value: float) -> str:
+    """Formats a numeric line the way a Russian-speaking user would write
+    it by hand (comma decimal separator, no trailing .0), e.g. 2.5 -> "2,5",
+    -1.0 -> "-1". Display-only -- never touches the underlying float used
+    for settlement."""
+    text = f"{value:g}"
+    return text.replace(".", ",")
+
+
+def _selection_display_ru(candidate: ValueCandidate) -> str:
+    """Human, Russian-language text for 'what exactly to bet on', built
+    only from real fields already on the candidate. This is a pure
+    display transform: candidate.selection itself is never modified here,
+    since tracking/settlement.py matches against that exact stored value.
+    """
+    if candidate.market_type == "total_goals":
+        line_text = _fmt_line_ru(candidate.line) if candidate.line is not None else ""
+        selection_lower = candidate.selection.lower()
+        if selection_lower == "over":
+            return f"Тотал больше {line_text}".strip()
+        if selection_lower == "under":
+            return f"Тотал меньше {line_text}".strip()
+        return candidate.selection
+    if candidate.market_type == "spread" and candidate.line is not None:
+        return f"{candidate.selection} ({candidate.line:+g})"
+    return candidate.selection
 
 
 @dataclass
@@ -153,6 +197,75 @@ def _render_candidate(candidate: ValueCandidate, index: int) -> str:
     return "\n".join(lines)
 
 
+def _short_risk_note(candidate: ValueCandidate) -> str:
+    """One short, plain-language risk line for the compact Telegram card
+    -- same honest tone as _level_reason but written for a non-technical
+    reader (no "consensus"/"outlier" jargon)."""
+    if candidate.signal_level == "HIGH":
+        return "Сильный сигнал: широкое согласие рынка, но результат матча не гарантирован."
+    if candidate.signal_level == "MEDIUM":
+        return "Средний сигнал: расхождение заметное, но требуется осторожность."
+    return "Слабый сигнал: только для отслеживания, не для основной ставки."
+
+
+def _render_telegram_card(candidate: ValueCandidate, index: int) -> str:
+    """Compact Russian-language card for the '🤖 Прогнозы ИИ' button --
+    only the fields required for a non-technical reader to understand one
+    signal. No raw diagnostics, no English text, no internal jargon."""
+    market_name = TELEGRAM_MARKET_LABELS.get(candidate.market_type, candidate.market_type)
+    label = SIGNAL_LABELS.get(candidate.signal_level, candidate.signal_level)
+    lines = [
+        f"{label}",
+        f"{candidate.home_team} — {candidate.away_team}"
+        + (f" ({candidate.league})" if candidate.league else ""),
+        f"🕒 {_fmt_local_time(candidate.match_datetime)}",
+        f"Рынок: {market_name}",
+        f"Выбор: {_selection_display_ru(candidate)}",
+        f"Коэффициент: {candidate.best_price:.2f} ({candidate.best_bookmaker})",
+        f"Справедливый коэффициент: {candidate.fair_price:.2f}",
+        f"Расхождение: {_fmt_pct(candidate.edge)} | EV: {_fmt_pct(candidate.expected_value)}",
+        f"Букмекеров: {candidate.unique_bookmaker_count}",
+        _short_risk_note(candidate),
+    ]
+    if candidate.signal_level == "LOW":
+        lines.append(_LOW_RISK_WARNING)
+    return "\n".join([f"{index}. " + lines[0]] + lines[1:])
+
+
+def render_telegram_signals_message(result: ValueSelectionResult, diagnostics: Diagnostics) -> List[str]:
+    """Concise, Russian, non-technical message for the '🤖 Прогнозы ИИ'
+    button: only the ranked signal cards (max MAX_TOTAL_SIGNALS, HIGH then
+    MEDIUM then LOW) plus a short count summary. No raw diagnostics, HTTP
+    error lists, skipped-competition lists, validation counts, duplicate
+    counts, rejection-reason frequency lists, API internals, or English
+    technical text -- all of that lives in render_value_report / /status
+    instead. Returns a list of message chunks so a long signal list never
+    exceeds Telegram's own message-length limit."""
+    header = "🤖 AI Ставки — сигналы на ближайшие 36 часов"
+    summary = (
+        f"Итого: HIGH — {diagnostics.high_count}, MEDIUM — {diagnostics.medium_count}, "
+        f"LOW — {diagnostics.low_count}, отклонено — {diagnostics.rejected_count}."
+    )
+
+    if not result.top_signals:
+        body = "На ближайшие 36 часов подходящих сигналов не найдено."
+        return [f"{header}\n\n{body}\n\n{summary}"]
+
+    cards = [_render_telegram_card(c, i) for i, c in enumerate(result.top_signals, start=1)]
+
+    chunks: List[str] = []
+    current = header
+    for card in cards:
+        block = "\n\n" + card
+        if len(current) + len(block) > TELEGRAM_MAX_CHARS and current != header:
+            chunks.append(current.strip())
+            current = ""
+        current += block
+    current += "\n\n" + summary
+    chunks.append(current.strip())
+    return chunks
+
+
 def compute_top_rejection_reasons(rejected: List[ValueCandidate], limit: int = 10) -> List[str]:
     """Ranks rejection reasons by how often real candidates hit them --
     frequency, not alphabetical order, so the most common real blocker
@@ -162,6 +275,35 @@ def compute_top_rejection_reasons(rejected: List[ValueCandidate], limit: int = 1
         for reason in candidate.rejection_reasons:
             counter[reason] += 1
     return [f"{reason} (x{count})" for reason, count in counter.most_common(limit)]
+
+
+_HTTP_CODE_RE = re.compile(r"HTTP (\d+)")
+
+
+def summarize_api_errors_ru(errors: List[str], sports_failed: Dict[str, str]) -> Optional[str]:
+    """Collapses every per-competition API error into one short Russian
+    line for /status (e.g. 'Некоторые турниры недоступны: HTTP 401 — 24
+    турнира.') instead of a raw per-competition error dump. Returns None
+    when there is nothing to report."""
+    all_messages = list(errors) + list(sports_failed.values())
+    if not all_messages:
+        return None
+
+    code_counts: Counter = Counter()
+    other_count = 0
+    for message in all_messages:
+        match = _HTTP_CODE_RE.search(message)
+        if match:
+            code_counts[match.group(1)] += 1
+        else:
+            other_count += 1
+
+    parts = [f"HTTP {code} — {count} турнира" for code, count in code_counts.most_common()]
+    if other_count:
+        parts.append(f"иная ошибка — {other_count} турнира")
+    if not parts:
+        return None
+    return "Некоторые турниры недоступны: " + "; ".join(parts) + "."
 
 
 def _render_rejected_candidate(candidate: ValueCandidate, index: int) -> str:
