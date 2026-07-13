@@ -24,9 +24,12 @@ once a paid plan makes current-season data available.
 from __future__ import annotations
 
 import datetime
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from ai_predictions.enrichment import EnrichmentSummary, enrich_candidates
+from ai_predictions.football_cache import FootballCache
 from ai_predictions.matching import (
     MarketGroup,
     ValidationStats,
@@ -119,6 +122,10 @@ class ValuePipelineResult:
     sports_discovered: List[str] = field(default_factory=list)
     sports_queried: List[str] = field(default_factory=list)
     sports_skipped: Dict[str, str] = field(default_factory=dict)
+    #: API-Football enrichment summary for this run (see
+    #: ai_predictions.enrichment.EnrichmentSummary) -- always present, even
+    #: when enrichment made zero real requests.
+    enrichment_summary: Optional[EnrichmentSummary] = None
 
 
 def _event_id(event: Dict[str, Any]) -> str:
@@ -157,6 +164,11 @@ def _candidate_to_prediction(candidate: ValueCandidate) -> Prediction:
         ranking_score=candidate.ranking_score,
         outlier_warning=outlier_flag,
         rejection_reason=rejection_text,
+        statistics_source=candidate.statistics_source,
+        statistics_cached=candidate.statistics_cached,
+        statistics_completeness=candidate.statistics_completeness,
+        statistics_score=candidate.statistics_score,
+        final_combined_score=candidate.final_combined_score,
     )
 
 
@@ -251,6 +263,21 @@ def run_value_predictions(
             markets_matched += 1
 
     all_candidates = build_value_candidates_from_groups(groups, raw_counts)
+
+    # API-Football statistics enrichment: takes the top preliminary
+    # candidates (pure odds-only ranking_score) and, best-effort, attaches
+    # a real recent-form statistics signal that only re-ranks WITHIN an
+    # already-decided HIGH/MEDIUM/LOW tier (see value_engine.compute_
+    # combined_score) -- never changes signal_level, never invents a
+    # market, never raises. select_value_recommendations below then uses
+    # the (possibly stats-nudged) score for its own within-tier ordering.
+    enrichment_summary = enrich_candidates(
+        all_candidates,
+        api_key=os.getenv("FOOTBALL_API_KEY"),
+        cache=FootballCache(now=now),
+        now=now,
+    )
+
     result = select_value_recommendations(all_candidates)
 
     outlier_warning_count = sum(1 for c in all_candidates if c.outlier_warning)
@@ -291,6 +318,13 @@ def run_value_predictions(
         sports_skipped=sports_skipped,
         discovery_source=discovery.source,
         discovery_error=discovery.discovery_error,
+        api_football_attempted_events=enrichment_summary.attempted_events,
+        api_football_matched_events=enrichment_summary.matched_events,
+        api_football_unmatched_events=enrichment_summary.unmatched_events,
+        api_football_requests_used=enrichment_summary.api_football_requests_used,
+        api_football_quota_remaining_today=enrichment_summary.api_football_quota_remaining_today,
+        api_football_season_allowed=enrichment_summary.season_allowed,
+        api_football_skipped_reason=enrichment_summary.skipped_reason,
     )
 
     debug_groups: List[str] = []
@@ -334,4 +368,5 @@ def run_value_predictions(
         sports_discovered=discovery.all_active_football,
         sports_queried=fetch_result.sports_queried,
         sports_skipped=sports_skipped,
+        enrichment_summary=enrichment_summary,
     )

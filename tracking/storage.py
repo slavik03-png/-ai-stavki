@@ -85,7 +85,12 @@ class TrackingStorage:
                     signal_level TEXT,
                     ranking_score REAL,
                     outlier_warning INTEGER NOT NULL DEFAULT 0,
-                    rejection_reason TEXT
+                    rejection_reason TEXT,
+                    statistics_source TEXT,
+                    statistics_cached INTEGER NOT NULL DEFAULT 0,
+                    statistics_completeness REAL,
+                    statistics_score REAL,
+                    final_combined_score REAL
                 )
                 """
             )
@@ -143,6 +148,11 @@ class TrackingStorage:
             "ranking_score": "REAL",
             "outlier_warning": "INTEGER NOT NULL DEFAULT 0",
             "rejection_reason": "TEXT",
+            "statistics_source": "TEXT",
+            "statistics_cached": "INTEGER NOT NULL DEFAULT 0",
+            "statistics_completeness": "REAL",
+            "statistics_score": "REAL",
+            "final_combined_score": "REAL",
         }
         for column, coltype in needed.items():
             if column not in existing:
@@ -161,6 +171,7 @@ class TrackingStorage:
         row = asdict(prediction)
         row["dedup_key"] = prediction.dedup_key
         row["outlier_warning"] = 1 if prediction.outlier_warning else 0
+        row["statistics_cached"] = 1 if prediction.statistics_cached else 0
         columns = [
             "prediction_id", "dedup_key", "created_at", "sport", "country", "league",
             "event_id", "event_start_time", "home_team", "away_team", "market_type",
@@ -169,6 +180,8 @@ class TrackingStorage:
             "data_provider", "model_version", "status", "final_score", "first_half_score",
             "settled_at", "settlement_explanation",
             "signal_level", "ranking_score", "outlier_warning", "rejection_reason",
+            "statistics_source", "statistics_cached", "statistics_completeness",
+            "statistics_score", "final_combined_score",
         ]
         placeholders = ", ".join(f":{c}" for c in columns)
         sql = f"INSERT INTO predictions ({', '.join(columns)}) VALUES ({placeholders})"

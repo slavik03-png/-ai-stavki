@@ -12,7 +12,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from ai_predictions.value_config import SIGNAL_LABELS
+from ai_predictions.value_config import SIGNAL_LABELS, SIGNAL_LABELS_RU_CARD
 from ai_predictions.value_engine import ValueCandidate
 from ai_predictions.value_selector import ValueSelectionResult
 from ai_predictions.window import parse_commence_time, format_display_time
@@ -82,7 +82,7 @@ def _selection_display_ru(candidate: ValueCandidate) -> str:
             return f"Тотал меньше {line_text}".strip()
         return candidate.selection
     if candidate.market_type == "spread" and candidate.line is not None:
-        return f"{candidate.selection} ({candidate.line:+g})"
+        return f"{candidate.selection} (Фора {candidate.line:+g})"
     return candidate.selection
 
 
@@ -120,6 +120,15 @@ class Diagnostics:
     sports_skipped: Dict[str, str] = field(default_factory=dict)
     discovery_source: str = "api"  # "api" or "fallback_hardcoded"
     discovery_error: "str | None" = None
+
+    # -- API-Football enrichment diagnostics (/status only) --
+    api_football_attempted_events: int = 0
+    api_football_matched_events: int = 0
+    api_football_unmatched_events: int = 0
+    api_football_requests_used: int = 0
+    api_football_quota_remaining_today: "int | None" = None
+    api_football_season_allowed: bool = False
+    api_football_skipped_reason: "str | None" = None
 
     def as_lines(self) -> List[str]:
         lines = [
@@ -160,6 +169,20 @@ class Diagnostics:
         if self.unsupported_markets_seen:
             unsupported = ", ".join(f"{k} ({v})" for k, v in sorted(self.unsupported_markets_seen.items()))
             lines.append(f"Неподдерживаемые рынки в ответе API (не смешиваются, не отброшены молча): {unsupported}")
+
+        lines.append("")
+        lines.append("Обогащение статистикой API-Football:")
+        if not self.api_football_season_allowed:
+            lines.append(
+                f"⚠️ Пропущено (0 запросов потрачено): {self.api_football_skipped_reason or 'причина не указана'}"
+            )
+        else:
+            lines.append(f"Событий на обогащение: {self.api_football_attempted_events}")
+            lines.append(f"Команды сопоставлены с API-Football: {self.api_football_matched_events}")
+            lines.append(f"Команды не сопоставлены: {self.api_football_unmatched_events}")
+            lines.append(f"Запросов к API-Football потрачено: {self.api_football_requests_used}")
+            if self.api_football_quota_remaining_today is not None:
+                lines.append(f"Остаток дневной квоты (с учётом резерва): {self.api_football_quota_remaining_today}")
         return lines
 
 
@@ -200,36 +223,48 @@ def _render_candidate(candidate: ValueCandidate, index: int) -> str:
 def _short_risk_note(candidate: ValueCandidate) -> str:
     """One short, plain-language risk line for the compact Telegram card
     -- same honest tone as _level_reason but written for a non-technical
-    reader (no "consensus"/"outlier" jargon)."""
+    reader (no "consensus"/"outlier" jargon). Mentions real statistics
+    agreement/limitation only when enrichment actually ran for this
+    candidate -- never claims a statistics opinion that was never
+    computed."""
     if candidate.signal_level == "HIGH":
-        return "Сильный сигнал: широкое согласие рынка, но результат матча не гарантирован."
-    if candidate.signal_level == "MEDIUM":
-        return "Средний сигнал: расхождение заметное, но требуется осторожность."
-    return "Слабый сигнал: только для отслеживания, не для основной ставки."
+        base = "Сильный сигнал: широкое согласие рынка, но результат матча не гарантирован."
+    elif candidate.signal_level == "MEDIUM":
+        base = "Средний сигнал: расхождение заметное, но требуется осторожность."
+    else:
+        base = "Слабый сигнал: только для отслеживания, не для основной ставки."
+
+    if candidate.statistics_source == "api_football" and candidate.statistics_score is not None:
+        if candidate.statistics_score >= 0.6:
+            base += " Статистика команд также в пользу этого исхода."
+        elif candidate.statistics_score <= 0.4:
+            base += " Статистика команд не полностью совпадает с этим сигналом — решение основано на цене, а не на форме."
+    elif candidate.statistics_source in ("unavailable", "unmatched", "quota_reserved", "not_attempted"):
+        base += " Статистика команд ограничена — сигнал основан только на реальных коэффициентах."
+    return base
 
 
 def _render_telegram_card(candidate: ValueCandidate, index: int) -> str:
     """Compact Russian-language card for the '🤖 Прогнозы ИИ' button --
     only the fields required for a non-technical reader to understand one
-    signal. No raw diagnostics, no English text, no internal jargon."""
-    market_name = TELEGRAM_MARKET_LABELS.get(candidate.market_type, candidate.market_type)
-    label = SIGNAL_LABELS.get(candidate.signal_level, candidate.signal_level)
-    lines = [
-        f"{label}",
-        f"{candidate.home_team} — {candidate.away_team}"
-        + (f" ({candidate.league})" if candidate.league else ""),
-        f"🕒 {_fmt_local_time(candidate.match_datetime)}",
-        f"Рынок: {market_name}",
-        f"Выбор: {_selection_display_ru(candidate)}",
-        f"Коэффициент: {candidate.best_price:.2f} ({candidate.best_bookmaker})",
-        f"Справедливый коэффициент: {candidate.fair_price:.2f}",
-        f"Расхождение: {_fmt_pct(candidate.edge)} | EV: {_fmt_pct(candidate.expected_value)}",
-        f"Букмекеров: {candidate.unique_bookmaker_count}",
-        _short_risk_note(candidate),
-    ]
+    signal (⚽ страна / 🏆 турнир / 🆚 команды / 🕒 дата / 🎯 ставка /
+    📈 коэффициент / 📊 уровень сигнала / 📝 почему). No raw diagnostics,
+    no English text, no internal jargon, no bookmaker name."""
+    label = SIGNAL_LABELS_RU_CARD.get(candidate.signal_level, candidate.signal_level)
+    lines = [f"{index}. {label}"]
+    if candidate.country:
+        lines.append(f"⚽ {candidate.country}")
+    if candidate.league:
+        lines.append(f"🏆 {candidate.league}")
+    lines.append(f"🆚 {candidate.home_team} — {candidate.away_team}")
+    lines.append(f"🕒 {_fmt_local_time(candidate.match_datetime)}")
+    lines.append(f"🎯 {_selection_display_ru(candidate)}")
+    lines.append(f"📈 {candidate.best_price:.2f}")
+    lines.append(f"📊 Уровень сигнала: {label.split(' ', 1)[-1]}")
+    lines.append(f"📝 {_short_risk_note(candidate)}")
     if candidate.signal_level == "LOW":
         lines.append(_LOW_RISK_WARNING)
-    return "\n".join([f"{index}. " + lines[0]] + lines[1:])
+    return "\n".join(lines)
 
 
 def render_telegram_signals_message(result: ValueSelectionResult, diagnostics: Diagnostics) -> List[str]:
@@ -243,8 +278,8 @@ def render_telegram_signals_message(result: ValueSelectionResult, diagnostics: D
     exceeds Telegram's own message-length limit."""
     header = "🤖 AI Ставки — сигналы на ближайшие 36 часов"
     summary = (
-        f"Итого: HIGH — {diagnostics.high_count}, MEDIUM — {diagnostics.medium_count}, "
-        f"LOW — {diagnostics.low_count}, отклонено — {diagnostics.rejected_count}."
+        f"Итого: ВЫСОКИЙ — {diagnostics.high_count}, СРЕДНИЙ — {diagnostics.medium_count}, "
+        f"НИЗКИЙ — {diagnostics.low_count}, отклонено — {diagnostics.rejected_count}."
     )
 
     if not result.top_signals:

@@ -17,3 +17,10 @@ not a bug. Do not spend time "fixing" candidate-builder or selection-engine logi
 curl `/fixtures?team=<id>&season=<current_year>` directly and read `errors` before assuming a code bug. Fixing
 requires an upgraded API-Football plan (or restructuring around a different real signal, e.g. cross-bookmaker
 price-dispersion value betting instead of team-strength stats) — it is a plan/product decision, not a patch.
+
+**Season-gate design (activated as an *enrichment* on top of odds-only value betting, not a replacement):**
+check the computed season against the allowed set *before* spending any quota; if it's out of range, skip every
+API-Football HTTP call for the whole run (0 requests) and mark affected candidates honestly (e.g.
+`statistics_source="unavailable"`) rather than letting each call fail individually and burn quota discovering the
+same restriction repeatedly. In production today (mid-2026) this means enrichment will report 0 real API-Football
+requests on every run — that is the season gate working correctly, not a broken integration.

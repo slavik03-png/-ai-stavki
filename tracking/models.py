@@ -117,6 +117,15 @@ class Prediction:
     outlier_warning: bool = False
     rejection_reason: Optional[str] = None
 
+    # -- API-Football statistics enrichment (optional, backward compatible:
+    #    rows saved before this feature existed simply leave these at
+    #    their defaults). --
+    statistics_source: Optional[str] = None
+    statistics_cached: bool = False
+    statistics_completeness: Optional[float] = None
+    statistics_score: Optional[float] = None
+    final_combined_score: Optional[float] = None
+
     def __post_init__(self) -> None:
         if self.recommendation_group not in RECOMMENDATION_GROUPS:
             raise ValueError(

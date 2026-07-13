@@ -11,7 +11,12 @@ the spec. Nothing here is invented or guessed.
 
 from __future__ import annotations
 
-MODEL_VERSION = "value-ranking-v2.0"
+#: Bumped for the API-Football enrichment activation: Prediction now
+#: carries statistics_* / final_combined_score fields and ranking within a
+#: tier can use a stats-informed final_combined_score. dedup_key includes
+#: model_version, so this always creates fresh tracking rows rather than
+#: silently reinterpreting older rows under a new meaning.
+MODEL_VERSION = "value-ranking-v2.1"
 
 SIGNAL_HIGH = "HIGH"
 SIGNAL_MEDIUM = "MEDIUM"
@@ -19,10 +24,23 @@ SIGNAL_LOW = "LOW"
 SIGNAL_REJECTED = "REJECTED"
 ALL_SIGNAL_LEVELS = (SIGNAL_HIGH, SIGNAL_MEDIUM, SIGNAL_LOW, SIGNAL_REJECTED)
 
+#: Used by the full diagnostics report (/status) -- kept exactly as before
+#: so existing diagnostics text/tests are unaffected by the user-facing
+#: Telegram card switching to Russian-only labels (see SIGNAL_LABELS_RU_CARD).
 SIGNAL_LABELS = {
     SIGNAL_HIGH: "🔥 HIGH",
     SIGNAL_MEDIUM: "🟡 MEDIUM",
     SIGNAL_LOW: "⚪ LOW",
+    SIGNAL_REJECTED: "Отклонено",
+}
+
+#: Russian-only labels for the concise, non-technical '🤖 Прогнозы ИИ'
+#: Telegram card -- the only surface a regular user sees. The full
+#: diagnostics report (/status) keeps SIGNAL_LABELS above unchanged.
+SIGNAL_LABELS_RU_CARD = {
+    SIGNAL_HIGH: "🔥 ВЫСОКИЙ",
+    SIGNAL_MEDIUM: "🟡 СРЕДНИЙ",
+    SIGNAL_LOW: "⚪ НИЗКИЙ",
     SIGNAL_REJECTED: "Отклонено",
 }
 
@@ -98,3 +116,50 @@ RANKING_OUTLIER_PENALTY = 20.0
 # ---------------------------------------------------------------------------
 
 from ai_predictions.window import WINDOW_HOURS  # noqa: E402,F401
+
+# ---------------------------------------------------------------------------
+# API-Football statistics enrichment (activation of the existing provider
+# for the value-divergence strategy). Every number below is a real,
+# deliberate operating limit -- never a guess -- chosen to protect the
+# API-Football free-plan daily quota (100 requests/day).
+# ---------------------------------------------------------------------------
+
+#: Only the top-N preliminary candidates (by ranking_score, before any
+#: statistics is considered) are ever eligible for enrichment. Bounds the
+#: worst-case request count regardless of how many real markets matched.
+ENRICHMENT_SHORTLIST_SIZE = 10
+
+#: Real published daily quota for the API-Football free plan.
+API_FOOTBALL_DAILY_QUOTA = 100
+
+#: Requests are never spent below this reserve, so a single "🤖 Прогнозы
+#: ИИ" run can never exhaust the account for the rest of the day.
+API_FOOTBALL_QUOTA_RESERVE = 10
+
+#: A cached API-Football answer (match/team resolution or statistics) is
+#: reused for this long before a fresh request is allowed for the same
+#: real query -- avoids re-spending quota on the same team/fixture inside
+#: one day.
+API_FOOTBALL_CACHE_TTL_HOURS = 24
+
+#: A fuzzy team-name match below this similarity score is treated as "no
+#: real match found" rather than guessed -- prevents attaching one team's
+#: statistics to a different real team that merely has a similar name.
+TEAM_MATCH_CONFIDENCE_FLOOR = 0.72
+
+#: The API-Football free plan rejects the `last`/`next` fixture params and
+#: any season outside this set (confirmed against the live API, not
+#: assumed) -- so almost every statistics call for a *current* match will
+#: fail structurally regardless of team matching. Enrichment checks this
+#: BEFORE spending any quota: if the analysis season is not in this set,
+#: it skips every API-Football call for the run and reports honestly why,
+#: rather than spending quota on calls already known to fail.
+API_FOOTBALL_FREE_PLAN_SEASONS = frozenset({2022, 2023, 2024})
+
+#: How strongly a real statistics-agreement signal (0..1, 0.5 = neutral)
+#: can nudge a candidate's ranking *within its own HIGH/MEDIUM/LOW tier*.
+#: Never large enough to matter more than the underlying odds edge/EV, and
+#: never crosses a tier boundary since value_selector always sorts by tier
+#: first. Statistics only re-orders already-qualified candidates; it can
+#: never promote a REJECTED candidate or change a signal_level.
+STATS_BLEND_MAGNITUDE = 2.0

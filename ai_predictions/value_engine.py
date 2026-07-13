@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional
 
 import statistics as _pystats
 
+from ai_predictions.country_map import country_for_sport_key
 from ai_predictions.matching import AWAY, DRAW, HOME, OVER, UNDER, MarketGroup
 from ai_predictions.value_config import (
     HIGH_MIN_BOOKMAKERS,
@@ -54,6 +55,7 @@ from ai_predictions.value_config import (
     SIGNAL_LOW,
     SIGNAL_MEDIUM,
     SIGNAL_REJECTED,
+    STATS_BLEND_MAGNITUDE,
 )
 from selection_engine.config import (
     MARKET_1X2,
@@ -151,6 +153,16 @@ class ValueCandidate:
 
     rejection_reasons: List[str] = field(default_factory=list)
     generated_at: str = ""
+
+    # -- API-Football statistics enrichment (optional; None/defaults mean
+    #    "never attempted", not "attempted and failed" -- see
+    #    ai_predictions/enrichment.py). Never changes signal_level; only
+    #    re-ranks within the already-decided tier via final_combined_score. --
+    statistics_source: str = "not_attempted"  # not_attempted|api_football|unavailable|unmatched|quota_reserved
+    statistics_cached: bool = False
+    statistics_completeness: float = 0.0  # 0..1, how much of the needed real data was retrieved
+    statistics_score: Optional[float] = None  # 0..1, 0.5 = neutral/no opinion; None until computed
+    final_combined_score: Optional[float] = None  # ranking_score nudged by statistics_score; None if never enriched
 
     def __post_init__(self) -> None:
         if not self.generated_at:
@@ -316,6 +328,21 @@ def compute_ranking_score(candidate: ValueCandidate) -> float:
     return round(score, 4)
 
 
+def compute_combined_score(candidate: ValueCandidate) -> float:
+    """Blends the real statistics-agreement signal (if enrichment ever ran
+    for this candidate) into ranking_score, purely as a within-tier
+    re-ranking nudge (Step: combined scoring). candidate.statistics_score
+    is None whenever enrichment was never attempted or produced nothing
+    usable -- in that exact case this returns ranking_score completely
+    unchanged, so an odds-only run behaves identically to before this
+    feature existed."""
+    if candidate.statistics_score is None:
+        return candidate.ranking_score
+    agreement = candidate.statistics_score - 0.5  # -0.5 (disagrees) .. +0.5 (agrees)
+    nudge = agreement * STATS_BLEND_MAGNITUDE * max(candidate.statistics_completeness, 0.0)
+    return round(candidate.ranking_score + nudge, 4)
+
+
 def _build_candidate_for_outcome(group: MarketGroup, canonical: str,
                                   raw_counts: Optional[Dict[Any, int]] = None) -> Optional[ValueCandidate]:
     """Consumes one MarketGroup's already-deduplicated (bookmaker, price)
@@ -370,7 +397,7 @@ def _build_candidate_for_outcome(group: MarketGroup, canonical: str,
         event_id=group.event_id,
         sport="soccer",
         league=group.league,
-        country=None,
+        country=country_for_sport_key(group.event_key[0]),
         match_datetime=group.commence_time,
         home_team=group.home_team,
         away_team=group.away_team,

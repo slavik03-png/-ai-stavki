@@ -37,10 +37,18 @@ _MULTI_MARKET_ELIGIBLE_LEVELS = (SIGNAL_HIGH, SIGNAL_MEDIUM)
 _TIER_RANK = {SIGNAL_HIGH: 0, SIGNAL_MEDIUM: 1, SIGNAL_LOW: 2}
 
 
+def _ranking_score(candidate: ValueCandidate) -> float:
+    """Uses final_combined_score when API-Football enrichment ran for this
+    candidate (see ai_predictions/value_engine.compute_combined_score);
+    otherwise falls back to the pure odds-only ranking_score, identical to
+    behaviour before enrichment existed."""
+    return candidate.final_combined_score if candidate.final_combined_score is not None else candidate.ranking_score
+
+
 def _sort_key(candidate: ValueCandidate):
     """HIGH always sorts before MEDIUM before LOW (tier is the primary
-    key); within a tier, higher ranking_score first."""
-    return (_TIER_RANK[candidate.signal_level], -candidate.ranking_score)
+    key); within a tier, higher score first."""
+    return (_TIER_RANK[candidate.signal_level], -_ranking_score(candidate))
 
 
 @dataclass
@@ -108,7 +116,7 @@ def _dedupe_per_event(candidates: List[ValueCandidate]) -> "tuple[List[ValueCand
             else:
                 extra.rejection_reasons.append(
                     f"По этому событию уже выбран более сильный сигнал "
-                    f"({best.selection}, {best.signal_level}, score {best.ranking_score:.2f})"
+                    f"({best.selection}, {best.signal_level}, score {_ranking_score(best):.2f})"
                 )
                 bumped.append(extra)
     return kept, bumped

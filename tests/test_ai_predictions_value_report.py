@@ -176,7 +176,7 @@ def test_telegram_message_shows_at_most_five_cards():
     diag = Diagnostics(high_count=0, medium_count=0, low_count=5, rejected_count=3)
     chunks = render_telegram_signals_message(result, diag)
     combined = "\n".join(chunks)
-    check("no more than 5 numbered cards appear", combined.count("⚪ LOW") == 5)
+    check("no more than 5 numbered cards appear", combined.count("⚪ НИЗКИЙ") == 5)
 
 
 def test_telegram_message_orders_high_before_medium_before_low():
@@ -191,7 +191,7 @@ def test_telegram_message_orders_high_before_medium_before_low():
     combined = "\n".join(render_telegram_signals_message(result, diag))
     check(
         "HIGH card appears before MEDIUM, which appears before LOW",
-        combined.index("🔥 HIGH") < combined.index("🟡 MEDIUM") < combined.index("⚪ LOW"),
+        combined.index("🔥 ВЫСОКИЙ") < combined.index("🟡 СРЕДНИЙ") < combined.index("⚪ НИЗКИЙ"),
         combined,
     )
 
@@ -241,7 +241,7 @@ def test_telegram_message_summary_line_matches_required_format():
     combined = "\n".join(render_telegram_signals_message(result, diag))
     check(
         "summary line matches the required Russian format",
-        "Итого: HIGH — 1, MEDIUM — 2, LOW — 3, отклонено — 40." in combined,
+        "Итого: ВЫСОКИЙ — 1, СРЕДНИЙ — 2, НИЗКИЙ — 3, отклонено — 40." in combined,
         combined,
     )
 
@@ -262,7 +262,7 @@ def test_telegram_message_shows_best_low_signals_when_no_high_or_medium():
     result = ValueSelectionResult(top_signals=[_candidate("evt-1", "1x2", "Home FC", "LOW")])
     diag = Diagnostics(high_count=0, medium_count=0, low_count=1, rejected_count=5)
     combined = "\n".join(render_telegram_signals_message(result, diag))
-    check("LOW signal is shown even with no HIGH/MEDIUM", "⚪ LOW" in combined)
+    check("LOW signal is shown even with no HIGH/MEDIUM", "⚪ НИЗКИЙ" in combined)
     check("LOW signal is clearly marked experimental", "Экспериментальный сигнал" in combined)
 
 

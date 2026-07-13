@@ -112,7 +112,7 @@ def test_genuine_divergence_produces_saved_recommendation():
         shown = [r for r in saved if r["signal_level"] == "MEDIUM"]
         check("the shown MEDIUM candidate is among the persisted rows", len(shown) == 1, shown)
         check("saved prediction is tagged odds-only data provider", shown[0]["data_provider"] == "the_odds_api", shown[0]["data_provider"])
-        check("saved prediction is tagged with the current model version", shown[0]["model_version"] == "value-ranking-v2.0", shown[0]["model_version"])
+        check("saved prediction is tagged with the current model version", shown[0]["model_version"] == "value-ranking-v2.1", shown[0]["model_version"])
         storage.close()
 
 

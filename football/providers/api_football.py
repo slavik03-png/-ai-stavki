@@ -145,6 +145,28 @@ class ApiFootballProvider(FootballStatisticsProvider):
 
     # -- team/league resolution ----------------------------------------------
 
+    def search_teams(self, query: str) -> Stat[List[Dict[str, Any]]]:
+        """Real, raw `/teams?search=` candidates (team id, name, country)
+        for `query` -- unlike `_resolve_team_id` (which silently commits to
+        the first hit), this returns every candidate the API found so a
+        caller can score/confirm the real match itself (see
+        ai_predictions/football_matching.py). Never guesses: an empty
+        response is Stat.missing, not an invented team."""
+        response, error = self._get("/teams", {"search": query})
+        if error:
+            return Stat.missing(error)
+        if not response:
+            return Stat.missing(f"Команда «{query}» не найдена в API-Football")
+        candidates = [
+            {
+                "id": entry.get("team", {}).get("id"),
+                "name": entry.get("team", {}).get("name", ""),
+                "country": entry.get("team", {}).get("country"),
+            }
+            for entry in response
+        ]
+        return Stat.ok(candidates)
+
     def _resolve_team_id(self, team: str) -> "tuple[Optional[int], Optional[str]]":
         # Only a confirmed empty search result (a real "not found" answer
         # from the API) is cached permanently for this run. Transient

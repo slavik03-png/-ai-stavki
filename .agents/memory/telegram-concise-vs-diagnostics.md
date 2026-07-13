@@ -23,3 +23,10 @@ unreadable and leaks internal API/HTTP detail to a non-technical audience.
 path. The diagnostics object should be cached separately (not just inside the
 30-minute prediction cache) so `/status` can report the last real run's
 diagnostics even after the prediction cache itself expires.
+
+**Relabeling one surface without touching the other:** when a requirement applies to only one of the two
+renders (e.g. "the user-facing card must show Russian signal levels"), add a *new*, separate label
+dict/constant for that render instead of mutating the shared constant both renders read from. Existing tests
+often assert exact literals (e.g. "🔥 HIGH" substrings, an exact "Итого: HIGH — n, ..." line) — grep the test
+file for every literal before changing a shared label constant, since a blind find-replace silently breaks the
+render you didn't mean to touch.
