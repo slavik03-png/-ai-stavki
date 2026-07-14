@@ -314,6 +314,26 @@ HISTORICAL_AVG_GOALS_AWAY = 1.15
 #: (if generic) data, not an invented number.
 HISTORICAL_FALLBACK_COMPLETENESS = 0.1
 
+# ---------------------------------------------------------------------------
+# Strict daily archive (2026-07-15 fix): once a day's worth of matches has
+# been fully analysed, the computed top-5 result itself is persisted so
+# that repeated "🤖 Прогнозы ИИ" presses within the same 24h window never
+# recompute anything or touch API-Football again -- they just replay the
+# saved archive. This is on top of (not a replacement for) the existing
+# per-item 24h caches in football_cache.py.
+# ---------------------------------------------------------------------------
+
+#: How long the persisted daily top-5 result stays valid before the next
+#: button press is allowed to trigger a fresh run -- exactly the required
+#: "24 hours from the moment of successful retrieval".
+DAILY_ARCHIVE_TTL_HOURS = 24.0
+
+#: How long a "refresh already in progress" marker is honoured before it
+#: is treated as stale (e.g. a previous run crashed mid-way) and a new
+#: attempt is allowed. Only guards against duplicate concurrent API spend,
+#: never blocks forever.
+DAILY_ARCHIVE_LOCK_TTL_MINUTES = 10.0
+
 #: Real, understandable betting markets this production version creates
 #: candidates for (Section 3 of the spec). Every key here must have a
 #: corresponding honest probability-derivation path in

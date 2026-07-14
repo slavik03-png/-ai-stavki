@@ -5,10 +5,17 @@ football analytics work has not altered bot behavior in any way.
 
 import asyncio
 import sys
+import tempfile
 from unittest.mock import AsyncMock, MagicMock
 
 sys.path.insert(0, ".")
 import bot
+from ai_predictions.football_cache import FootballCache
+
+# Isolated tempfile archive/cache db -- the "status" button now reads the
+# persistent daily archive (see tests/test_bot_ai_predictions.py); this
+# file must never touch the real production cache database.
+bot._open_football_cache = lambda now: FootballCache(db_path=tempfile.mktemp(), now=now)
 
 results = []
 

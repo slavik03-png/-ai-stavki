@@ -31,6 +31,8 @@ from ai_predictions.prediction_report import render_predictions_message
 from ai_predictions.prediction_selector import RankedRecommendation, select_recommendations
 from ai_predictions.value_config import (
     BET_MARKET_LABELS_RU,
+    DAILY_ARCHIVE_LOCK_TTL_MINUTES,
+    DAILY_ARCHIVE_TTL_HOURS,
     MAX_FIXTURES_ANALYSED_PER_RUN,
     SIGNAL_HIGH,
     SIGNAL_LOW,
@@ -45,15 +47,31 @@ _LEVEL_TO_RECOMMENDATION_GROUP = {SIGNAL_HIGH: "main", SIGNAL_MEDIUM: "alternati
 
 _UNSET = object()
 
+#: Persistent key for the strict daily archive (see module docstring in
+#: value_config.py, "Strict daily archive"). Fixed window (36h) is baked
+#: into the key name itself since the window is a constant, not a
+#: parameter, in this production version -- if that ever changes, the key
+#: must change with it so an old-window archive is never replayed as if
+#: it were computed for a new window.
+DAILY_ARCHIVE_KEY = "daily_archive:predictions_top5_window36h"
+
+#: Marker key used to detect a refresh already under way (see
+#: mark_refresh_in_progress/is_refresh_in_progress below) -- separate
+#: from the archive key itself so a crashed/slow run never looks like a
+#: successful archive.
+DAILY_ARCHIVE_LOCK_KEY = "daily_archive:refresh_in_progress"
+
 
 @dataclass
 class FootballPipelineResult:
     telegram_messages: List[str] = field(default_factory=list)
     found_fixtures: int = 0
     analysed_fixtures: int = 0
+    fully_stat_fixtures: int = 0
     recommendations_count: int = 0
     api_football_requests_used: int = 0
     api_football_requests_remaining: int = 0
+    api_football_requests_used_today: int = 0
     odds_status: str = "unavailable"  # available | quota_exhausted | unavailable
     fixture_discovery: Optional[FixtureDiscoveryResult] = None
     recommendations: List[RankedRecommendation] = field(default_factory=list)
@@ -61,6 +79,69 @@ class FootballPipelineResult:
     saved_count: int = 0
     duplicate_count: int = 0
     errors: List[str] = field(default_factory=list)
+
+
+@dataclass
+class DailyArchive:
+    """A previously computed daily result, replayed verbatim on later
+    button presses within the same 24h window -- zero recomputation, zero
+    API-Football calls."""
+    messages: List[str]
+    diagnostics: Dict[str, Any]
+    generated_at: datetime.datetime
+
+
+def load_daily_archive(
+    football_cache: FootballCache, now: datetime.datetime, *, ignore_ttl: bool = False,
+) -> Optional[DailyArchive]:
+    """Returns the persisted daily result if it is still within
+    DAILY_ARCHIVE_TTL_HOURS, else None. `ignore_ttl=True` is used only for
+    the "a refresh is already in progress -- fall back to whatever we
+    have" path, so a user still gets something useful instead of a bare
+    "please wait"."""
+    ttl = 24.0 * 365 if ignore_ttl else DAILY_ARCHIVE_TTL_HOURS
+    payload = football_cache.get(DAILY_ARCHIVE_KEY, ttl_hours=ttl)
+    if payload is None:
+        return None
+    try:
+        generated_at = datetime.datetime.fromisoformat(payload["generated_at"])
+    except (KeyError, ValueError):
+        return None
+    return DailyArchive(messages=payload["messages"], diagnostics=payload.get("diagnostics", {}), generated_at=generated_at)
+
+
+def save_daily_archive(football_cache: FootballCache, result: "FootballPipelineResult", now: datetime.datetime) -> None:
+    diagnostics = {
+        "found_fixtures": result.found_fixtures,
+        "analysed_fixtures": result.analysed_fixtures,
+        "fully_stat_fixtures": result.fully_stat_fixtures,
+        "recommendations_count": result.recommendations_count,
+        "api_football_requests_used": result.api_football_requests_used,
+        "api_football_requests_remaining": result.api_football_requests_remaining,
+        "api_football_requests_used_today": result.api_football_requests_used_today,
+        "odds_status": result.odds_status,
+        "errors": result.errors,
+        "source": "новый запрос",
+    }
+    football_cache.set(DAILY_ARCHIVE_KEY, {
+        "messages": result.telegram_messages,
+        "diagnostics": diagnostics,
+        "generated_at": now.isoformat(),
+    })
+
+
+def mark_refresh_in_progress(football_cache: FootballCache, now: datetime.datetime) -> None:
+    football_cache.set(DAILY_ARCHIVE_LOCK_KEY, {"started_at": now.isoformat()})
+
+
+def is_refresh_in_progress(football_cache: FootballCache, now: datetime.datetime) -> bool:
+    """True if some process (this one or another) started a refresh in
+    the last DAILY_ARCHIVE_LOCK_TTL_MINUTES and has not finished it yet
+    (a finished run always overwrites the daily archive itself, which
+    callers should check FIRST -- this is purely the "someone else is
+    mid-run right now" signal for requirement 11: never start a second
+    concurrent batch of API-Football requests)."""
+    return football_cache.get(DAILY_ARCHIVE_LOCK_KEY, ttl_hours=DAILY_ARCHIVE_LOCK_TTL_MINUTES / 60.0) is not None
 
 
 def _recommendation_to_prediction(rec: RankedRecommendation, odds: Optional[float]) -> Prediction:
@@ -138,6 +219,7 @@ def run_football_predictions(
     # many fixtures get ranked.
     all_candidates: List[MarketCandidate] = []
     analysed = 0
+    fully_stat_fixture_ids: set = set()
     quota_exhausted_during_run = False
     for fixture in fixture_discovery.fixtures[:max_fixtures_analysed]:
         if not football_cache.can_spend(1):
@@ -145,6 +227,8 @@ def run_football_predictions(
         candidates, _ = build_candidates_for_fixture(fixture, provider, football_cache)
         all_candidates.extend(candidates)
         analysed += 1
+        if any(c.source != "historical_baseline" for c in candidates):
+            fully_stat_fixture_ids.add(fixture.fixture_id)
 
     if quota_exhausted_during_run:
         result.errors.append(
@@ -154,8 +238,10 @@ def run_football_predictions(
         )
 
     result.analysed_fixtures = analysed
+    result.fully_stat_fixtures = len(fully_stat_fixture_ids)
     result.api_football_requests_used = provider.requests_made
     result.api_football_requests_remaining = football_cache.requests_available()
+    result.api_football_requests_used_today = football_cache.requests_used_today()
 
     ranked = select_recommendations(all_candidates)
     result.recommendations = ranked

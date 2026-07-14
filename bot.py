@@ -2,7 +2,7 @@ import asyncio
 import os
 import csv
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 
 import requests
@@ -24,15 +24,31 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 # The Odds API quota is exhausted -- exactly the failure this version
 # fixes.
 from ai_predictions.football_cache import FootballCache
-from ai_predictions.football_pipeline import run_football_predictions
-from ai_predictions.fixtures import discover_fixtures_in_window
-from ai_predictions.value_config import FIXTURE_LIST_CACHE_TTL_HOURS
+from ai_predictions.football_pipeline import (
+    DailyArchive,
+    is_refresh_in_progress,
+    load_daily_archive,
+    mark_refresh_in_progress,
+    run_football_predictions,
+    save_daily_archive,
+)
+from ai_predictions.value_config import DAILY_ARCHIVE_TTL_HOURS
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY")
 
+#: Telegram numeric user IDs allowed to force a refresh of the strict
+#: daily archive via /refresh_data (requirement: an admin-only action,
+#: never triggered by the regular "🤖 Прогнозы ИИ"/"ℹ️ Статус" buttons).
+#: Comma-separated in the env var; empty/unset means nobody can force a
+#: refresh (fails closed, never silently open to everyone).
+ADMIN_TELEGRAM_IDS = {
+    int(raw) for raw in os.getenv("ADMIN_TELEGRAM_IDS", "").split(",") if raw.strip().isdigit()
+}
+
 AI_PREDICTIONS_PREFIX = "ai_predictions"
+ADMIN_REFRESH_CONFIRM_PREFIX = "admin_refresh_confirm"
 MIN_CREDITS_FOR_AI_PREDICTIONS = 10
 CACHE_LABELS_AI_PREDICTIONS = "🤖 Прогнозы ИИ"
 
@@ -76,9 +92,13 @@ cache: Dict[str, Dict[str, Any]] = {}
 cache_locks: Dict[str, asyncio.Lock] = {prefix: asyncio.Lock() for prefix in CACHE_LABELS}
 last_known_credits: Optional[int] = None
 
-# ai_predictions_cache = {"messages": List[str], "timestamp": float} --
-# separate from the odds cache above (different prefix namespace,
-# different lock). Holds only the concise, user-facing signal messages.
+# In-process fast-path mirror of the persisted daily archive (see
+# ai_predictions/football_pipeline.py's DailyArchive/load_daily_archive/
+# save_daily_archive) -- avoids re-opening the SQLite cache for every
+# button press within the same process. The SQLite-backed archive is the
+# real source of truth (survives restarts, shared across any concurrent
+# process); this dict is purely a latency shortcut and is always kept in
+# sync with it.
 ai_predictions_cache: Optional[Dict[str, Any]] = None
 ai_predictions_lock = asyncio.Lock()
 
@@ -92,6 +112,14 @@ ai_predictions_last_diagnostics: Optional[Dict[str, Any]] = None
 # the required /status "last successful prediction run" field. None until
 # the first successful run since the process started.
 ai_predictions_last_success_ts: Optional[float] = None
+
+
+def _open_football_cache(now: datetime) -> FootballCache:
+    """Single seam for opening the persistent API-Football cache/archive
+    store -- tests monkeypatch this to point at an isolated tempfile
+    database instead of the real production one (see
+    tests/test_bot_ai_predictions.py)."""
+    return FootballCache(now=now)
 
 
 def main_keyboard() -> InlineKeyboardMarkup:
@@ -226,6 +254,37 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(build_status_text(), reply_markup=main_keyboard())
 
 
+async def refresh_data_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/refresh_data -- admin-only. Requirement 8: archive refresh is only
+    ever allowed automatically (once per 24h, lazily on the first regular
+    button press) or via this explicit, confirmation-gated admin action
+    that clearly warns about real quota spend. Never wired to the normal
+    "🤖 Прогнозы ИИ"/"ℹ️ Статус" buttons."""
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id not in ADMIN_TELEGRAM_IDS:
+        await update.message.reply_text("⛔ Эта команда доступна только администратору.")
+        return
+
+    remaining_text = "неизвестно"
+    if FOOTBALL_API_KEY:
+        try:
+            football_cache = _open_football_cache(datetime.now(timezone.utc))
+            remaining_text = str(football_cache.requests_available())
+            football_cache.close()
+        except Exception:
+            pass
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("⚠️ Подтвердить обновление", callback_data=ADMIN_REFRESH_CONFIRM_PREFIX),
+    ]])
+    await update.message.reply_text(
+        "⚠️ Это принудительно обновит суточный архив прогнозов ИИ и обратится к API-Football, "
+        f"даже если текущий архив ещё не устарел. Осталось запросов сегодня: {remaining_text}.\n\n"
+        "Подтвердить обновление?",
+        reply_markup=keyboard,
+    )
+
+
 async def send_cached(query, prefix: str) -> None:
     entry = cache[prefix]
     await query.message.reply_text(
@@ -237,19 +296,27 @@ async def send_cached(query, prefix: str) -> None:
         await query.message.reply_document(document=f, filename=os.path.basename(entry["csv_path"]))
 
 
-async def _send_cached_predictions(query) -> None:
-    messages = ai_predictions_cache["messages"]
-    await query.message.reply_text(
-        "🗄 Прогноз из кэша (не старше 30 минут), новый запрос не выполнялся.\n\n"
-        + messages[0],
-        reply_markup=main_keyboard(),
-    )
+def _format_archive_header(generated_at: datetime, *, stale: bool = False) -> str:
+    label = "Данные взяты из суточного архива" if not stale else "Архив ещё обновляется, показаны последние сохранённые данные"
+    return f"🗄 {label}. Последнее обновление: {generated_at.strftime('%d.%m.%Y %H:%M')} UTC."
+
+
+async def _reply_archive(query, archive: DailyArchive, *, stale: bool = False) -> None:
+    header = _format_archive_header(archive.generated_at, stale=stale)
+    messages = archive.messages or ["На ближайшие 36 часов подходящих сигналов не найдено."]
+    await query.message.reply_text(header + "\n\n" + messages[0], reply_markup=main_keyboard())
     for extra in messages[1:]:
         await query.message.reply_text(extra, reply_markup=main_keyboard())
 
 
-async def handle_ai_predictions(query) -> None:
-    global ai_predictions_cache, ai_predictions_last_diagnostics
+async def handle_ai_predictions(query, *, force_refresh: bool = False) -> None:
+    """Strict daily archive: the first successful run of the (rolling)
+    24h window computes and persists the top-5 result once; every later
+    press within that window -- from any process, even across a bot
+    restart -- replays the saved archive verbatim and never calls
+    API-Football again. `force_refresh=True` is only ever passed from the
+    admin-confirmed /refresh_data flow."""
+    global ai_predictions_cache, ai_predictions_last_diagnostics, ai_predictions_last_success_ts
 
     # API-Football is the only REQUIRED key -- The Odds API is optional
     # coefficient enrichment only (production v3).
@@ -260,56 +327,75 @@ async def handle_ai_predictions(query) -> None:
         )
         return
 
-    now_ts = datetime.now(timezone.utc).timestamp()
-    if ai_predictions_cache and (now_ts - ai_predictions_cache["timestamp"]) < CACHE_TTL_SECONDS:
-        await _send_cached_predictions(query)
-        return
+    now_dt = datetime.now(timezone.utc)
+    football_cache = _open_football_cache(now_dt)
+    try:
+        if not force_refresh:
+            archive = load_daily_archive(football_cache, now_dt)
+            if archive is not None:
+                ai_predictions_cache = {"archive": archive}
+                ai_predictions_last_diagnostics = {**archive.diagnostics, "source": "архив"}
+                await _reply_archive(query, archive)
+                return
 
-    if ai_predictions_lock.locked():
-        await query.message.reply_text(
-            "⏳ Прогноз уже формируется. Подожди немного и нажми кнопку снова.",
-            reply_markup=main_keyboard(),
-        )
-        return
-
-    async with ai_predictions_lock:
-        now_ts = datetime.now(timezone.utc).timestamp()
-        if ai_predictions_cache and (now_ts - ai_predictions_cache["timestamp"]) < CACHE_TTL_SECONDS:
-            await _send_cached_predictions(query)
+        if ai_predictions_lock.locked() or is_refresh_in_progress(football_cache, now_dt):
+            stale = load_daily_archive(football_cache, now_dt, ignore_ttl=True)
+            if stale is not None:
+                await _reply_archive(query, stale, stale=True)
+            else:
+                await query.message.reply_text(
+                    "⏳ Архив данных уже формируется. Подожди немного и нажми кнопку снова.",
+                    reply_markup=main_keyboard(),
+                )
             return
 
-        # Odds API credits never gate this button any more -- API-Football
-        # is sufficient on its own; The Odds API is optional enrichment.
-        await query.message.reply_text(
-            "🤖 Анализирую матчи ближайших 36 часов по данным API-Football... "
-            "Это может занять минуту."
-        )
-        try:
-            global ai_predictions_last_success_ts
-            result = await asyncio.to_thread(run_football_predictions)
-            messages = result.telegram_messages or ["На ближайшие 36 часов подходящих сигналов не найдено."]
-            now_ts2 = datetime.now(timezone.utc).timestamp()
-            ai_predictions_cache = {
-                "messages": messages,
-                "timestamp": now_ts2,
-            }
-            # Full technical diagnostics are kept only for /status -- never
-            # sent here.
-            ai_predictions_last_diagnostics = {
-                "found_fixtures": result.found_fixtures,
-                "analysed_fixtures": result.analysed_fixtures,
-                "recommendations_count": result.recommendations_count,
-                "api_football_requests_used": result.api_football_requests_used,
-                "api_football_requests_remaining": result.api_football_requests_remaining,
-                "odds_status": result.odds_status,
-                "errors": result.errors,
-                "timestamp": now_ts2,
-            }
-            ai_predictions_last_success_ts = now_ts2
-            for message in messages:
-                await query.message.reply_text(message, reply_markup=main_keyboard())
-        except Exception as e:
-            await query.message.reply_text(f"❌ Ошибка при формировании прогнозов ИИ: {e}", reply_markup=main_keyboard())
+        async with ai_predictions_lock:
+            # Re-check now that we hold the lock, in case another task in
+            # this same process just finished filling the archive.
+            if not force_refresh:
+                archive = load_daily_archive(football_cache, now_dt)
+                if archive is not None:
+                    ai_predictions_cache = {"archive": archive}
+                    ai_predictions_last_diagnostics = {**archive.diagnostics, "source": "архив"}
+                    await _reply_archive(query, archive)
+                    return
+
+            mark_refresh_in_progress(football_cache, now_dt)
+            intro = (
+                "🤖 Формирую суточный архив прогнозов по данным API-Football... Это может занять минуту."
+                if not force_refresh else
+                "⚠️ Администратор запросил принудительное обновление архива. Обращаюсь к API-Football..."
+            )
+            await query.message.reply_text(intro)
+            try:
+                result = await asyncio.to_thread(
+                    run_football_predictions, football_cache=football_cache, now=now_dt,
+                )
+                messages = result.telegram_messages or ["На ближайшие 36 часов подходящих сигналов не найдено."]
+                save_daily_archive(football_cache, result, now_dt)
+                archive = DailyArchive(messages=messages, diagnostics={}, generated_at=now_dt)
+                ai_predictions_cache = {"archive": archive}
+                # Full technical diagnostics are kept only for /status --
+                # never sent here.
+                ai_predictions_last_diagnostics = {
+                    "found_fixtures": result.found_fixtures,
+                    "analysed_fixtures": result.analysed_fixtures,
+                    "fully_stat_fixtures": result.fully_stat_fixtures,
+                    "recommendations_count": result.recommendations_count,
+                    "api_football_requests_used": result.api_football_requests_used,
+                    "api_football_requests_remaining": result.api_football_requests_remaining,
+                    "api_football_requests_used_today": result.api_football_requests_used_today,
+                    "odds_status": result.odds_status,
+                    "errors": result.errors,
+                    "source": "новый запрос",
+                }
+                ai_predictions_last_success_ts = now_dt.timestamp()
+                for message in messages:
+                    await query.message.reply_text(message, reply_markup=main_keyboard())
+            except Exception as e:
+                await query.message.reply_text(f"❌ Ошибка при формировании прогнозов ИИ: {e}", reply_markup=main_keyboard())
+    finally:
+        football_cache.close()
 
 
 def _format_ago(now_dt: datetime, then_dt: datetime) -> str:
@@ -339,41 +425,46 @@ def _odds_api_status_text() -> str:
 
 def build_status_text() -> str:
     """All technical/diagnostic information lives here -- the normal
-    prediction message never shows any of this. Fields match the
-    production-fix spec's required /status list exactly: Telegram token,
-    API-Football key, API-Football requests remaining, fixture cache age,
-    fixtures found in the next 36h, Odds API tri-state, last successful
-    run."""
+    prediction message never shows any of this. Per the strict daily
+    archive requirements, /status only ever READS existing persisted
+    state (the daily archive + the quota counter, both plain SQLite
+    reads) -- it never calls fixture discovery or any other live
+    API-Football endpoint, so pressing "ℹ️ Статус" can never itself spend
+    quota."""
     ok_bot = "доступен" if TELEGRAM_BOT_TOKEN else "отсутствует"
     ok_football = "доступен" if FOOTBALL_API_KEY else "отсутствует"
 
     now_dt = datetime.now(timezone.utc)
     requests_remaining_text = "неизвестно"
-    fixture_cache_age_text = "нет данных (ещё не запрашивались)"
-    fixtures_found_text = "неизвестно (ещё не было запросов)"
+    requests_used_today_text = "неизвестно"
+    archive = None
 
     if FOOTBALL_API_KEY:
         try:
-            football_cache = FootballCache(now=now_dt)
+            football_cache = _open_football_cache(now_dt)
             requests_remaining_text = str(football_cache.requests_available())
-            discovery = discover_fixtures_in_window(FOOTBALL_API_KEY, football_cache, now_dt)
-            fixtures_found_text = str(len(discovery.fixtures))
-            newest_cached_at = None
-            for date_str in discovery.dates_queried:
-                cached_at = football_cache.cached_at(f"fixtures:date:{date_str}")
-                if cached_at is not None and (newest_cached_at is None or cached_at > newest_cached_at):
-                    newest_cached_at = cached_at
-            if newest_cached_at is not None:
-                fixture_cache_age_text = _format_ago(now_dt, newest_cached_at)
+            requests_used_today_text = str(football_cache.requests_used_today())
+            archive = load_daily_archive(football_cache, now_dt, ignore_ttl=True)
             football_cache.close()
         except Exception:
             pass
 
-    last_run_text = (
-        _format_ago(now_dt, datetime.fromtimestamp(ai_predictions_last_success_ts, tz=timezone.utc))
-        if ai_predictions_last_success_ts is not None
-        else "ещё не было успешных запусков"
-    )
+    if archive is not None:
+        archive_age_text = _format_ago(now_dt, archive.generated_at)
+        last_update_text = archive.generated_at.strftime("%d.%m.%Y %H:%M") + " UTC"
+        is_fresh = (now_dt - archive.generated_at) <= timedelta(hours=DAILY_ARCHIVE_TTL_HOURS)
+        archive_state_text = "актуален" if is_fresh else "устарел (>24ч), будет обновлён при следующем запросе"
+        d = archive.diagnostics
+        found_text = str(d.get("found_fixtures", "неизвестно"))
+        fully_stat_text = str(d.get("fully_stat_fixtures", "неизвестно"))
+        recs_text = str(d.get("recommendations_count", "неизвестно"))
+        source_text = d.get("source", "неизвестно")
+    else:
+        archive_age_text = "нет данных (архив ещё не сформирован)"
+        last_update_text = "ещё не было успешных обновлений"
+        archive_state_text = "отсутствует"
+        found_text = fully_stat_text = recs_text = "0"
+        source_text = "нет данных"
 
     lines = [
         "ℹ️ Статус AI Ставки",
@@ -381,26 +472,24 @@ def build_status_text() -> str:
         f"Telegram token: {ok_bot}",
         f"API-Football key: {ok_football}",
         f"Осталось запросов к API-Football сегодня: {requests_remaining_text}",
-        f"Возраст кэша фикстур: {fixture_cache_age_text}",
-        f"Найдено матчей в ближайшие 36 часов: {fixtures_found_text}",
+        f"Использовано запросов к API-Football сегодня: {requests_used_today_text}",
+        "",
+        "Суточный архив прогнозов:",
+        f"Последнее успешное обновление: {last_update_text}",
+        f"Возраст архива: {archive_age_text} ({archive_state_text})",
+        f"Сохранено матчей: {found_text}",
+        f"Матчей с полной статистикой: {fully_stat_text}",
+        f"Сохранено рекомендаций: {recs_text}",
+        f"Источник последнего ответа пользователю: {source_text}",
         f"The Odds API: {_odds_api_status_text()}",
-        f"Последний успешный запуск прогнозов ИИ: {last_run_text}",
         "",
         "Кэш линии (хранится 30 минут):",
         cache_status_lines(),
     ]
 
-    if ai_predictions_last_diagnostics:
+    if archive is not None and archive.diagnostics.get("errors"):
         lines.append("")
-        lines.append("Прогнозы ИИ — последний запуск:")
-        lines.append(
-            f"Найдено: {ai_predictions_last_diagnostics.get('found_fixtures', 0)}, "
-            f"проанализировано: {ai_predictions_last_diagnostics.get('analysed_fixtures', 0)}, "
-            f"рекомендаций: {ai_predictions_last_diagnostics.get('recommendations_count', 0)}"
-        )
-        run_errors = ai_predictions_last_diagnostics.get("errors")
-        if run_errors:
-            lines.append(f"Примечания: {'; '.join(run_errors[:3])}")
+        lines.append(f"Примечания: {'; '.join(archive.diagnostics['errors'][:3])}")
 
     return "\n".join(lines)
 
@@ -416,6 +505,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if query.data == AI_PREDICTIONS_PREFIX:
         await handle_ai_predictions(query)
+        return
+
+    if query.data == ADMIN_REFRESH_CONFIRM_PREFIX:
+        user_id = query.from_user.id if query.from_user else None
+        if user_id not in ADMIN_TELEGRAM_IDS:
+            await query.message.reply_text("⛔ Недостаточно прав для этого действия.")
+            return
+        await handle_ai_predictions(query, force_refresh=True)
         return
 
     if query.data and query.data.startswith("odds:"):
@@ -489,6 +586,7 @@ def main() -> None:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("refresh_data", refresh_data_command))
     app.add_handler(CallbackQueryHandler(handle_callback))
     print("AI Ставки Bot запущен")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
