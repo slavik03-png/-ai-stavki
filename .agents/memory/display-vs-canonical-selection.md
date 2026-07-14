@@ -24,3 +24,20 @@ never mutate `candidate.selection` itself or the value written to
 `Prediction.selection`. If this mismatch is ever fixed, it needs to be done
 in `value_engine.py`/`settlement.py` together, with existing tracked
 predictions considered, not as a side effect of a display change.
+
+**Related, separate mismatch:** `MarketCandidate.market_key` (the
+fixture-discovery-first pipeline's composite key, e.g. `"home_win"`,
+`"over_2_5"`, `"double_chance_1x"`, `"btts_yes"`) is stored verbatim into
+`Prediction.market_type` by `football_pipeline.py`'s
+`_recommendation_to_prediction`, but `tracking/settlement.py`'s `_SETTLERS`
+dict keys on canonical types (`"1x2"`, `"double_chance"`, `"total_goals"`,
+`"btts"`) with separate `selection`/`line` fields — so `market_type` lookup
+fails and these tracking rows can never actually be settled by
+`settle_prediction` as stored. This is a second, pre-existing latent bug in
+the same family as the one above (out of scope to fix in `tracking`/
+`ai_predictions` directly). The `analytics/` module (permanent stats DB,
+independent of `tracking/`) works around it locally with its own
+`MARKET_KEY_MAP` (`analytics/config.py`) that translates the 10 composite
+keys into `(market_type, selection, line)` triples before calling
+`settle_prediction` — that translation is analytics-only adapter code, not
+a fix to the underlying `tracking`/`ai_predictions` mismatch.

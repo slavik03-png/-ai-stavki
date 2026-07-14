@@ -35,6 +35,18 @@ from ai_predictions.football_pipeline import (
 from ai_predictions.value_config import DAILY_ARCHIVE_TTL_HOURS
 from ai_predictions.window import format_card_time
 
+# The AI Betting Analytics module (analytics/) is a new, independent
+# top-level package -- like ai_predictions/, it is fine for bot.py to
+# import it directly. It never imports tracking/ or selection_engine/
+# back into bot.py's own import graph (see tests/test_tracking_bot_isolation.py
+# and tests/test_selection_isolation.py, which only forbid bot.py from
+# importing those two packages specifically).
+from analytics.config import DEFAULT_STAKE, RESULT_CHECK_INTERVAL_MINUTES
+from analytics.export import export_csv, export_excel
+from analytics.reports import admin_report, compact_report
+from analytics.result_checker import run_check_cycle
+from analytics.storage import AnalyticsStorage
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY")
@@ -50,6 +62,7 @@ ADMIN_TELEGRAM_IDS = {
 
 AI_PREDICTIONS_PREFIX = "ai_predictions"
 ADMIN_REFRESH_CONFIRM_PREFIX = "admin_refresh_confirm"
+STATISTICS_PREFIX = "analytics_stats"
 MIN_CREDITS_FOR_AI_PREDICTIONS = 10
 CACHE_LABELS_AI_PREDICTIONS = "🤖 Прогнозы ИИ"
 
@@ -132,8 +145,85 @@ def main_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🏒 Хоккей", callback_data="odds:hockey"),
         ],
         [InlineKeyboardButton("🤖 Прогнозы ИИ", callback_data=AI_PREDICTIONS_PREFIX)],
+        [InlineKeyboardButton("📈 Статистика", callback_data=STATISTICS_PREFIX)],
         [InlineKeyboardButton("ℹ️ Статус", callback_data="status")],
     ])
+
+
+def _open_analytics_storage(now: datetime) -> AnalyticsStorage:
+    """Single seam for opening the permanent analytics database -- tests
+    monkeypatch this to point at an isolated tempfile database instead of
+    the real production one, same pattern as _open_football_cache."""
+    return AnalyticsStorage(now=now)
+
+
+async def handle_statistics(query) -> None:
+    """Public '📈 Статистика' button -- a short, non-technical report
+    (no rationale/internal reasoning, just headline numbers)."""
+    now_dt = datetime.now(timezone.utc)
+    storage = _open_analytics_storage(now_dt)
+    try:
+        text = await asyncio.to_thread(compact_report, storage, stake=DEFAULT_STAKE, now=now_dt)
+    finally:
+        storage.close()
+    await query.message.reply_text(text, reply_markup=main_keyboard())
+
+
+async def admin_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/admin_report -- admin-only detailed statistics (breakdown by
+    league/market/signal level, 30d/90d/all-time, trend), plus CSV and
+    Excel exports of the complete permanent prediction history."""
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id not in ADMIN_TELEGRAM_IDS:
+        await update.message.reply_text("⛔ Эта команда доступна только администратору.")
+        return
+
+    now_dt = datetime.now(timezone.utc)
+    storage = _open_analytics_storage(now_dt)
+    try:
+        text = await asyncio.to_thread(admin_report, storage, stake=DEFAULT_STAKE, now=now_dt)
+        await update.message.reply_text(text)
+
+        csv_path = os.path.join(tempfile.gettempdir(), f"analytics_export_{now_dt.strftime('%Y%m%d_%H%M%S')}.csv")
+        xlsx_path = os.path.join(tempfile.gettempdir(), f"analytics_export_{now_dt.strftime('%Y%m%d_%H%M%S')}.xlsx")
+        await asyncio.to_thread(export_csv, storage, csv_path)
+        await asyncio.to_thread(export_excel, storage, xlsx_path)
+        with open(csv_path, "rb") as f:
+            await update.message.reply_document(document=f, filename=os.path.basename(csv_path))
+        with open(xlsx_path, "rb") as f:
+            await update.message.reply_document(document=f, filename=os.path.basename(xlsx_path))
+    finally:
+        storage.close()
+
+
+async def _analytics_result_checker_loop(app: Application) -> None:
+    """Background task (started from Application.post_init, no extra
+    job-queue dependency needed): periodically checks pending analytics
+    predictions for finished fixtures and settles them. Never spends
+    API-Football requests beyond FootballCache's existing daily reserve,
+    and never touches the daily archive/prediction pipeline."""
+    interval_seconds = RESULT_CHECK_INTERVAL_MINUTES * 60
+    while True:
+        try:
+            now_dt = datetime.now(timezone.utc)
+            football_cache = _open_football_cache(now_dt)
+            storage = _open_analytics_storage(now_dt)
+            try:
+                summary = await asyncio.to_thread(
+                    run_check_cycle, storage, football_cache, FOOTBALL_API_KEY, now_dt, stake=DEFAULT_STAKE,
+                )
+                if summary["checked"]:
+                    print(f"[analytics] result checker: {summary}")
+            finally:
+                football_cache.close()
+                storage.close()
+        except Exception as exc:
+            print(f"[analytics] result checker error: {exc}")
+        await asyncio.sleep(interval_seconds)
+
+
+async def _post_init(app: Application) -> None:
+    asyncio.create_task(_analytics_result_checker_loop(app))
 
 
 def fetch_odds(sport_keys: List[str]) -> tuple[list[dict[str, Any]], str]:
@@ -525,6 +615,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await handle_ai_predictions(query)
         return
 
+    if query.data == STATISTICS_PREFIX:
+        await handle_statistics(query)
+        return
+
     if query.data == ADMIN_REFRESH_CONFIRM_PREFIX:
         user_id = query.from_user.id if query.from_user else None
         if user_id not in ADMIN_TELEGRAM_IDS:
@@ -605,7 +699,9 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("refresh_data", refresh_data_command))
+    app.add_handler(CommandHandler("admin_report", admin_report_command))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    app.post_init = _post_init
     print("AI Ставки Bot запущен")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

@@ -41,6 +41,9 @@ from ai_predictions.value_config import (
 from tracking.models import STATUS_PENDING, Prediction
 from tracking.storage import DuplicatePredictionError, TrackingStorage
 
+from analytics.integration import record_recommendation
+from analytics.storage import AnalyticsStorage
+
 FOOTBALL_PIPELINE_MODEL_VERSION = "football-predictions-v3"
 
 _LEVEL_TO_RECOMMENDATION_GROUP = {SIGNAL_HIGH: "main", SIGNAL_MEDIUM: "alternative", SIGNAL_LOW: "high_risk"}
@@ -187,6 +190,7 @@ def run_football_predictions(
     now: Optional[datetime.datetime] = None,
     max_fixtures_analysed: int = MAX_FIXTURES_ANALYSED_PER_RUN,
     football_cache: Optional[FootballCache] = None,
+    analytics_storage: Optional[AnalyticsStorage] = None,
 ) -> FootballPipelineResult:
     now = now or datetime.datetime.now(datetime.timezone.utc)
     if football_api_key is _UNSET:
@@ -197,6 +201,8 @@ def run_football_predictions(
     storage = storage or TrackingStorage()
     owns_football_cache = football_cache is None
     football_cache = football_cache or FootballCache(now=now)
+    owns_analytics_storage = analytics_storage is None
+    analytics_storage = analytics_storage or AnalyticsStorage(now=now)
 
     result = FootballPipelineResult()
 
@@ -261,6 +267,7 @@ def run_football_predictions(
         found_fixtures=result.found_fixtures, analysed_fixtures=result.analysed_fixtures,
     )
 
+    archive_version = now.date().isoformat()
     saved, duplicates = 0, 0
     for rec in ranked:
         odds = result.odds_by_fixture.get(rec.candidate.fixture.fixture_id)
@@ -270,6 +277,14 @@ def run_football_predictions(
             saved += 1
         except DuplicatePredictionError:
             duplicates += 1
+        # Permanent analytics recording (see analytics/ package) -- never
+        # allowed to affect the real save/duplicate counters above, and
+        # never allowed to raise: a failure here must not break Telegram
+        # delivery of the recommendations that were already computed.
+        record_recommendation(
+            analytics_storage, rec, odds,
+            model_version=FOOTBALL_PIPELINE_MODEL_VERSION, archive_version=archive_version, now=now,
+        )
     result.saved_count = saved
     result.duplicate_count = duplicates
 
@@ -277,5 +292,7 @@ def run_football_predictions(
         storage.close()
     if owns_football_cache:
         football_cache.close()
+    if owns_analytics_storage:
+        analytics_storage.close()
 
     return result
