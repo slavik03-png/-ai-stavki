@@ -75,7 +75,51 @@ _LEAGUE_RU = {
     "europa conference league": "Лига конференций",
     "world cup": "Чемпионат мира",
     "euro championship": "Чемпионат Европы",
+    "friendlies": "Товарищеские матчи",
+    "friendlies clubs": "Товарищеские матчи клубов",
+    "club friendlies": "Товарищеские матчи клубов",
 }
+
+#: Verified, well-known Russian names for major clubs/national teams only.
+#: Anything absent keeps its original (usually English/local) name rather
+#: than a guessed translation or transliteration -- see team_ru() below.
+_TEAM_RU = {
+    "manchester united": "Манчестер Юнайтед",
+    "manchester city": "Манчестер Сити",
+    "real madrid": "Реал Мадрид",
+    "barcelona": "Барселона",
+    "atletico madrid": "Атлетико Мадрид",
+    "bayern munich": "Бавария",
+    "borussia dortmund": "Боруссия Дортмунд",
+    "paris saint germain": "Пари Сен-Жермен",
+    "juventus": "Ювентус",
+    "ac milan": "Милан",
+    "inter": "Интер",
+    "napoli": "Наполи",
+    "liverpool": "Ливерпуль",
+    "chelsea": "Челси",
+    "arsenal": "Арсенал",
+    "tottenham": "Тоттенхэм",
+    "ajax": "Аякс",
+    "porto": "Порту",
+    "benfica": "Бенфика",
+    "sporting cp": "Спортинг",
+    "zenit": "Зенит",
+    "spartak moscow": "Спартак Москва",
+    "cska moscow": "ЦСКА Москва",
+    "dynamo kyiv": "Динамо Киев",
+    "shakhtar donetsk": "Шахтёр Донецк",
+}
+
+
+def team_ru(name: Optional[str]) -> Optional[str]:
+    """Best-effort Russian display name for a team. Only translates names
+    that are verified in `_TEAM_RU` -- anything else is returned exactly
+    as received (never a fabricated or guessed transliteration)."""
+    if not name:
+        return name
+    key = name.strip().lower()
+    return _TEAM_RU.get(key, name)
 
 
 def country_ru(country: Optional[str]) -> Optional[str]:

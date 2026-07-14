@@ -68,3 +68,12 @@ def to_display_timezone(dt: datetime.datetime) -> datetime.datetime:
 def format_display_time(dt: datetime.datetime) -> str:
     local = to_display_timezone(dt)
     return local.strftime("%d.%m.%Y %H:%M") + " (Екатеринбург)"
+
+
+def format_card_time(dt: datetime.datetime) -> str:
+    """Short human time for the user-facing prediction card and the daily
+    archive header -- Yekaterinburg local time, no explicit city label
+    (the bot's audience is fixed to that timezone). Kept separate from
+    format_display_time() above, which existing diagnostics/tests rely on."""
+    local = to_display_timezone(dt)
+    return local.strftime("%d.%m.%Y в %H:%M")

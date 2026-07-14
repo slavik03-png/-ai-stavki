@@ -33,6 +33,7 @@ from ai_predictions.football_pipeline import (
     save_daily_archive,
 )
 from ai_predictions.value_config import DAILY_ARCHIVE_TTL_HOURS
+from ai_predictions.window import format_card_time
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
@@ -297,8 +298,9 @@ async def send_cached(query, prefix: str) -> None:
 
 
 def _format_archive_header(generated_at: datetime, *, stale: bool = False) -> str:
-    label = "Данные взяты из суточного архива" if not stale else "Архив ещё обновляется, показаны последние сохранённые данные"
-    return f"🗄 {label}. Последнее обновление: {generated_at.strftime('%d.%m.%Y %H:%M')} UTC."
+    label = "Данные из суточного архива" if not stale else "Архив ещё обновляется, показаны последние сохранённые данные"
+    when = format_card_time(generated_at)
+    return f"💾 {label}\nОбновлено: {when}"
 
 
 async def _reply_archive(query, archive: DailyArchive, *, stale: bool = False) -> None:

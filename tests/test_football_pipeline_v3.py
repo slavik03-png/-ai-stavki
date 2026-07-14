@@ -27,7 +27,9 @@ from ai_predictions.fixtures import Fixture
 from ai_predictions.football_cache import FootballCache
 from ai_predictions.football_predictions import build_candidates_for_fixture
 from ai_predictions.prediction_selector import select_recommendations
-from ai_predictions.prediction_report import render_predictions_message, render_no_signal_message, HEADING
+from ai_predictions.prediction_report import (
+    render_predictions_message, render_no_signal_message, render_recommendation_card, HEADING,
+)
 from ai_predictions.odds_lookup import lookup_coefficients, OddsLookupResult
 import ai_predictions.football_pipeline as football_pipeline_mod
 from ai_predictions.football_pipeline import run_football_predictions
@@ -262,9 +264,9 @@ def test_card_format_and_no_technical_leakage():
     fixture = _fixture(20, "Ceara", "Athletic Club", hours_ahead=16, country="Brazil", league="Serie B")
     from ai_predictions.football_predictions import MarketCandidate
     candidate = MarketCandidate(
-        fixture=fixture, market_key="over_1_5", market_label_ru="Тотал больше 1.5",
+        fixture=fixture, market_key="over_1_5", market_label_ru="Тотал больше 1,5",
         probability=0.68, completeness=0.8, sample_size_category="strong",
-        rationale="команды регулярно создают голевые моменты; текущая форма и средняя результативность поддерживают выбранный тотал.",
+        rationale="Резерв запросов к API-Football почти исчерпан, использован provider fallback pipeline.",
         source="goal_model",
     )
     from ai_predictions.prediction_selector import RankedRecommendation
@@ -272,18 +274,70 @@ def test_card_format_and_no_technical_leakage():
     messages = render_predictions_message([rec], {}, found_fixtures=12, analysed_fixtures=8)
 
     check("heading present", messages[0].startswith(HEADING))
-    check("Found/Analysed/Recommendations counts present", "Найдено матчей: 12" in messages[0]
-          and "Проанализировано: 8" in messages[0] and "Рекомендаций: 1" in messages[0])
+    check("Found/Analysed/Selected counts present", "Найдено матчей: 12" in messages[0]
+          and "Проанализировано: 8" in messages[0] and "Отобрано прогнозов: 1" in messages[0])
 
     card = messages[1]
-    for required in ("Страна:", "Турнир:", "Матч:", "Дата и время:", "Ставка:", "Расчётная вероятность:", "Коэффициент:", "Краткое обоснование:"):
-        check(f"card contains '{required}'", required in card)
-    check("card shows 'нет данных' coefficient", "Коэффициент: нет данных" in card)
+    for required in (
+        "⚽ ПРОГНОЗ №1", "🌍 Страна:", "🏆 Турнир:", "👥 Матч:", "🕒 Начало:",
+        "🎯 Ставка:", "📊 Расчётная вероятность:", "💰 Ориентировочный коэффициент:",
+        "Уровень сигнала:", "Краткое объяснение:",
+    ):
+        check(f"card contains '{required}'", required in card, card)
+    check("card shows 'нет данных' coefficient", "Ориентировочный коэффициент: нет данных" in card)
     check("card shows whole-percent probability", "68%" in card)
+    check("signal level shown as a plain Russian word, not a raw code", "средний" in card and "MEDIUM" not in card)
     check("no bookmaker name leaked", "BookA" not in card and "bookmaker" not in card.lower())
+    check(
+        "card never uses the internal rationale text (avoids leaking API-Football/quota/pipeline wording)",
+        candidate.rationale not in card,
+    )
     check("no technical/internal terms leaked", not any(
-        term in card for term in ("edge", "EV", "HTTP", "fixture_id", "api_football", "quota")
+        term in card for term in ("edge", "EV", "HTTP", "fixture_id", "api_football", "quota",
+                                   "fixture", "fallback", "pipeline", "provider")
     ))
+    check("disclaimer shown once, after the cards", messages[-1].startswith("ℹ️") and "аналитической оценкой" in messages[-1])
+
+
+def test_double_chance_markets_spelled_out_in_russian():
+    """Rule: never show a raw code like '1X'/'X2' -- always the full,
+    plain-Russian meaning."""
+    from ai_predictions.value_config import BET_MARKET_LABELS_RU
+    check("1X spelled out", BET_MARKET_LABELS_RU["double_chance_1x"] == "Победа хозяев или ничья")
+    check("X2 spelled out", BET_MARKET_LABELS_RU["double_chance_x2"] == "Победа гостей или ничья")
+    check("totals use a comma decimal separator", "," in BET_MARKET_LABELS_RU["over_2_5"]
+          and "." not in BET_MARKET_LABELS_RU["over_2_5"])
+
+
+def test_signal_level_russian_word_and_emoji():
+    from ai_predictions.value_config import SIGNAL_EMOJI_RU_CARD, SIGNAL_WORD_RU_CARD
+    check("HIGH -> высокий/🔥", SIGNAL_WORD_RU_CARD["HIGH"] == "высокий" and SIGNAL_EMOJI_RU_CARD["HIGH"] == "🔥")
+    check("MEDIUM -> средний/🟡", SIGNAL_WORD_RU_CARD["MEDIUM"] == "средний" and SIGNAL_EMOJI_RU_CARD["MEDIUM"] == "🟡")
+    check("LOW -> низкий/⚪", SIGNAL_WORD_RU_CARD["LOW"] == "низкий" and SIGNAL_EMOJI_RU_CARD["LOW"] == "⚪")
+
+
+def test_odds_formatted_with_russian_comma():
+    from ai_predictions.football_predictions import MarketCandidate
+    from ai_predictions.prediction_selector import RankedRecommendation
+    fixture = _fixture(21, "Home Z", "Away Z", hours_ahead=5)
+    candidate = MarketCandidate(
+        fixture=fixture, market_key="home_win", market_label_ru="Победа хозяев",
+        probability=0.7, completeness=0.9, sample_size_category="strong", rationale="r", source="api_football_predictions",
+    )
+    rec = RankedRecommendation(candidate=candidate, signal_level="HIGH")
+    card = render_recommendation_card(1, rec, 1.65)
+    check("odds shown with a comma, not a dot", "1,65" in card and "1.65" not in card)
+    card_no_odds = render_recommendation_card(1, rec, None)
+    check("missing odds shown honestly as 'нет данных', never a bookmaker name", "нет данных" in card_no_odds)
+
+
+def test_utc_to_yekaterinburg_time_conversion():
+    """Rule: cards and the archive header must show Yekaterinburg local
+    time, not raw UTC."""
+    from ai_predictions.window import format_card_time
+    utc_dt = datetime.datetime(2026, 7, 14, 9, 0, 0, tzinfo=datetime.timezone.utc)
+    text = format_card_time(utc_dt)
+    check("09:00 UTC becomes 14:00 in Yekaterinburg (UTC+5)", text == "14.07.2026 в 14:00", text)
 
 
 def test_no_signal_message_exact_text():

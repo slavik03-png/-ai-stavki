@@ -9,3 +9,4 @@
 - [Telegram output: concise vs diagnostics split](telegram-concise-vs-diagnostics.md) — user-facing signal message and technical diagnostics are two separate render functions; never merge them back into one.
 - [Display selection vs canonical settlement token](display-vs-canonical-selection.md) — ValueCandidate.selection is a display string, but settlement matches canonical tokens; translate only in rendering, never mutate the stored field.
 - [API-Football-primary production architecture (v3)](api-football-primary-architecture.md) — Odds API must never gate candidate creation, only optional price display; quota reserve is patched via football_cache's own namespace, not value_config's.
+- [Telegram card vs internal rationale](telegram-card-vs-internal-rationale.md) — never render candidate.rationale directly on a user card; build a separate non-technical explanation, and use window.format_card_time() (Yekaterinburg) for card/archive timestamps.

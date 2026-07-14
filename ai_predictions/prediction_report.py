@@ -6,8 +6,13 @@ card format, heading and no-signal text below are exact, spec-mandated
 strings, not derived from the older report's layout.
 
 Nothing here shows a bookmaker name, an edge/EV number, an internal
-scoring formula, an API identifier, a raw rejection list, an HTTP error
-or any other technical detail -- see tests/test_football_pipeline_cards.py.
+scoring formula, an API identifier, a raw rejection list, an HTTP error,
+a raw market code (e.g. "1X"), a Python/module/pipeline name, a request
+count, or any other technical detail -- see
+tests/test_football_pipeline_v3.py and tests/test_prediction_card_format.py.
+The full technical diagnostics remain reachable only via /status
+(ai_predictions/football_pipeline.py's diagnostics dict + bot.py's
+build_status_text()), never mixed into these user-facing messages.
 """
 
 from __future__ import annotations
@@ -15,9 +20,9 @@ from __future__ import annotations
 from typing import List, Optional
 
 from ai_predictions.prediction_selector import RankedRecommendation
-from ai_predictions.ru_translation import country_ru, league_ru
-from ai_predictions.value_config import SIGNAL_LABELS_RU_CARD
-from ai_predictions.window import format_display_time
+from ai_predictions.ru_translation import country_ru, league_ru, team_ru
+from ai_predictions.value_config import SIGNAL_EMOJI_RU_CARD, SIGNAL_WORD_RU_CARD
+from ai_predictions.window import format_card_time
 
 NO_SIGNAL_TEMPLATE = (
     "На ближайшие 36 часов найдено {count} матчей, но ни один вариант не достиг "
@@ -25,6 +30,13 @@ NO_SIGNAL_TEMPLATE = (
 )
 
 HEADING = "🤖 ПРОГНОЗЫ ИИ НА БЛИЖАЙШИЕ 36 ЧАСОВ"
+
+#: Shown once, after all cards, whenever at least one recommendation was
+#: produced -- never mixed into an individual card.
+DISCLAIMER = (
+    "ℹ️ Прогноз является аналитической оценкой, а не гарантией результата. "
+    "Решение о ставке пользователь принимает самостоятельно."
+)
 
 
 def render_no_signal_message(found_fixtures: int) -> str:
@@ -35,32 +47,83 @@ def _format_probability(probability: float) -> str:
     return f"{round(probability * 100)}%"
 
 
-def _format_odds(odds: Optional[float]) -> str:
+def _format_odds_ru(odds: Optional[float]) -> str:
+    """Russian decimal-comma formatting, e.g. 1,65 -- or the honest
+    'нет данных' when no real coefficient was found (never fabricated,
+    never a bookmaker name)."""
     if odds is None:
-        return "Коэффициент: нет данных"
-    return f"Коэффициент: {odds:.2f}"
+        return "нет данных"
+    return f"{odds:.2f}".replace(".", ",")
+
+
+def _basis_sentence_ru(source: str) -> str:
+    """One plain-language sentence describing what the estimate is based
+    on -- deliberately never mentions API-Football, caching, quotas, or
+    any other implementation detail (that belongs only in /status)."""
+    if source == "api_football_predictions":
+        return "Оценка основана на аналитической модели с учётом текущей формы и состава команд."
+    if source == "recent_form":
+        return "Оценка основана на статистике побед и поражений команд в последних матчах."
+    if source == "goal_model":
+        return "Оценка основана на среднем количестве голов, забитых и пропущенных командами в последних матчах."
+    # historical_baseline or any other/unknown source: honest about the
+    # limitation without naming internal mechanisms.
+    return "Точной статистики по этому матчу нет, поэтому оценка основана на общих футбольных показателях."
+
+
+def _caution_sentence_ru(signal_level: str, sample_size_category: str) -> Optional[str]:
+    """An optional second sentence, only when the confidence genuinely
+    needs a caveat -- keeps HIGH-tier cards free of unnecessary hedging."""
+    if sample_size_category == "none":
+        return "Статистика по конкретному матчу ограничена, поэтому сигнал имеет низкий уровень."
+    if signal_level == "LOW":
+        return "Данных по матчу немного, поэтому сигнал имеет низкий уровень."
+    if signal_level == "MEDIUM":
+        return "Сигнал средней надёжности — стоит проявить осторожность."
+    return None
+
+
+def _short_explanation_ru(candidate, signal_level: str) -> str:
+    """1-2 short, non-technical sentences for a regular user. Deliberately
+    NOT `candidate.rationale` -- that internal field is written for
+    tracking/settlement records and may mention API-Football, quota
+    reserves, match counts, etc., none of which belong on a user-facing
+    card (rules 8-11 of the card-formatting spec)."""
+    parts = [_basis_sentence_ru(candidate.source)]
+    caution = _caution_sentence_ru(signal_level, candidate.sample_size_category)
+    if caution:
+        parts.append(caution)
+    return " ".join(parts)
 
 
 def render_recommendation_card(index: int, recommendation: RankedRecommendation, odds: Optional[float]) -> str:
+    """Renders exactly one prediction as its own short, plain-Russian
+    card. Kept as a standalone function (not inlined into the message
+    builder) so it can be reused/tested independently."""
     c = recommendation.candidate
     fixture = c.fixture
-    tier_label = SIGNAL_LABELS_RU_CARD[recommendation.signal_level]
+    emoji = SIGNAL_EMOJI_RU_CARD[recommendation.signal_level]
+    word = SIGNAL_WORD_RU_CARD[recommendation.signal_level]
     country = country_ru(fixture.league_country) or "неизвестно"
     league = league_ru(fixture.league_name) or "неизвестно"
-    when = format_display_time(fixture.kickoff_utc)
+    home = team_ru(fixture.home_team)
+    away = team_ru(fixture.away_team)
+    when = format_card_time(fixture.kickoff_utc)
 
     lines = [
-        f"{index}. {tier_label}",
+        f"⚽ ПРОГНОЗ №{index}",
         "",
-        f"Страна: {country}",
-        f"Турнир: {league}",
-        f"Матч: {fixture.home_team} — {fixture.away_team}",
-        f"Дата и время: {when}",
-        f"Ставка: {c.market_label_ru}",
-        f"Расчётная вероятность: {_format_probability(c.probability)}",
-        _format_odds(odds),
+        f"🌍 Страна: {country}",
+        f"🏆 Турнир: {league}",
+        f"👥 Матч: {home} — {away}",
+        f"🕒 Начало: {when}",
+        f"🎯 Ставка: {c.market_label_ru}",
+        f"📊 Расчётная вероятность: {_format_probability(c.probability)}",
+        f"💰 Ориентировочный коэффициент: {_format_odds_ru(odds)}",
+        f"{emoji} Уровень сигнала: {word}",
         "",
-        f"Краткое обоснование: {c.rationale}",
+        "Краткое объяснение:",
+        _short_explanation_ru(c, recommendation.signal_level),
     ]
     return "\n".join(lines)
 
@@ -72,9 +135,10 @@ def render_predictions_message(
     found_fixtures: int,
     analysed_fixtures: int,
 ) -> List[str]:
-    """Returns one or more Telegram message chunks -- the heading (with
-    Found/Analysed/Recommendations counts) followed by every card, or the
-    exact no-signal message if `recommendations` is empty."""
+    """Returns one or more Telegram message chunks: a short heading (with
+    Found/Analysed/Selected counts), one card per recommendation, and a
+    closing disclaimer -- or the exact no-signal message alone if
+    `recommendations` is empty."""
     if not recommendations:
         return [render_no_signal_message(found_fixtures)]
 
@@ -82,10 +146,10 @@ def render_predictions_message(
         f"{HEADING}\n\n"
         f"Найдено матчей: {found_fixtures}\n"
         f"Проанализировано: {analysed_fixtures}\n"
-        f"Рекомендаций: {len(recommendations)}"
+        f"Отобрано прогнозов: {len(recommendations)}"
     )
     cards = [
         render_recommendation_card(i + 1, rec, odds_by_fixture.get(rec.candidate.fixture.fixture_id))
         for i, rec in enumerate(recommendations)
     ]
-    return [header] + cards
+    return [header] + cards + [DISCLAIMER]

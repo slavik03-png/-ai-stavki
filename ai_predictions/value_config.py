@@ -345,16 +345,34 @@ SUPPORTED_BET_MARKETS = (
 )
 
 #: Russian display label for each supported market (used on the Telegram
-#: card's "Ставка:" line).
+#: card's "Ставка:" line). Double-chance and totals are spelled out in
+#: full, plain Russian (never a raw code like "1X") and use a comma as the
+#: decimal separator, matching Russian typographic convention.
 BET_MARKET_LABELS_RU = {
     "home_win": "Победа хозяев",
     "draw": "Ничья",
     "away_win": "Победа гостей",
-    "double_chance_1x": "1X",
-    "double_chance_x2": "X2",
-    "over_1_5": "Тотал больше 1.5",
-    "over_2_5": "Тотал больше 2.5",
-    "under_3_5": "Тотал меньше 3.5",
+    "double_chance_1x": "Победа хозяев или ничья",
+    "double_chance_x2": "Победа гостей или ничья",
+    "over_1_5": "Тотал больше 1,5",
+    "over_2_5": "Тотал больше 2,5",
+    "under_3_5": "Тотал меньше 3,5",
     "btts_yes": "Обе забьют — да",
     "btts_no": "Обе забьют — нет",
+}
+
+#: Card-only signal vocabulary (ai_predictions/prediction_report.py). A
+#: plain lowercase Russian word plus the level's emoji, combined as
+#: "{emoji} Уровень сигнала: {word}" -- separate from SIGNAL_LABELS_RU_CARD
+#: above (kept for any other/legacy caller) because the user-facing card no
+#: longer shows the level as a single uppercase "🔥 ВЫСОКИЙ" token.
+SIGNAL_WORD_RU_CARD = {
+    SIGNAL_HIGH: "высокий",
+    SIGNAL_MEDIUM: "средний",
+    SIGNAL_LOW: "низкий",
+}
+SIGNAL_EMOJI_RU_CARD = {
+    SIGNAL_HIGH: "🔥",
+    SIGNAL_MEDIUM: "🟡",
+    SIGNAL_LOW: "⚪",
 }
