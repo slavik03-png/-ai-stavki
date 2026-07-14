@@ -31,6 +31,35 @@ silently reintroduce the same production outage.
 new signal needs a live bookmaker price to be *created* (forbidden) vs.
 merely *displayed alongside* (fine, via the optional-enrichment pattern).
 
+## Quota-reserve gating must live per-HTTP-call, never per-fixture
+
+An earlier version of this pipeline pre-checked `can_spend(N)` once per
+fixture *before* attempting any analysis at all, and aborted the entire
+per-run loop the moment the daily reserve hit zero — this produced
+`analysed=0, recommendations=0` even with 250+ real fixtures available,
+because cached/free data for those fixtures was never even consulted.
+
+**Fix:** every fixture in the analysis loop is always processed; the
+reserve check moved down to wrap each individual real network call
+(predictions fetch, per-team recent-form fetch) so a cache HIT never
+touches the check at all, and a cache MISS with no budget left simply
+degrades that one ingredient to "unavailable" instead of aborting the
+fixture. A fixture with truly nothing real available (no cache, no
+budget) still gets ranked via a historical-baseline fallback (real
+aggregate football statistics, not fixture-specific), hard-capped at LOW
+confidence via a `sample_size_category == "none"` check in the
+classifier — never silently dropped, never presented above LOW.
+
+**Why:** "quota exhausted" must degrade recommendation *confidence/count
+per fixture*, not zero out the whole run — the two failure modes look
+identical in a naive per-fixture pre-check but are very different in
+user impact.
+
+**How to apply:** any future rate-limited enrichment step should gate at
+the smallest real unit of network cost (one HTTP call), read persistent
+cache first, and provide a clearly-labelled reduced-confidence fallback
+rather than an early `break`/abort of the whole batch.
+
 ## Daily quota reserve vs. hard cap
 
 `ai_predictions/football_cache.py`'s `API_FOOTBALL_QUOTA_RESERVE` is an

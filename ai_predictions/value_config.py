@@ -261,15 +261,58 @@ PROB_LOW_MIN = 0.56
 PROB_HIGH_MIN_COMPLETENESS = 0.6
 
 #: Upper bound on how many discovered fixtures are actually sent through
-#: real API-Football analysis calls (predictions + recent form) in one
-#: run. Protects the free-plan daily quota: worst case is 3 real requests
-#: per newly-analysed fixture (1 predictions + 2 team-form calls), so this
-#: cap keeps a single run's worst-case spend well inside
-#: API_FOOTBALL_DAILY_QUOTA - API_FOOTBALL_QUOTA_RESERVE even before the
-#: cache/quota-reserve checks kick in. Fixtures are analysed soonest-
+#: the analysis step (cache lookups + at-most-best-effort live calls) in
+#: one run. This is a runtime/CPU bound, NOT the quota safety mechanism --
+#: quota is protected per real HTTP call (see football_predictions.py's
+#: budget-checked fetch helpers), so every one of these fixtures is always
+#: analysed even once the daily reserve is fully spent (using cache and/or
+#: the historical-baseline fallback). Fixtures are analysed soonest-
 #: kickoff first; any fixture beyond this cap is honestly reported as
 #: "found but not analysed", never silently dropped.
 MAX_FIXTURES_ANALYSED_PER_RUN = 25
+
+#: How long a real `/predictions` answer for one fixture stays valid
+#: before a fresh call is allowed -- same 6h horizon as the fixture list
+#: itself (predictions rarely change meaningfully hour-to-hour, and this
+#: keeps repeated runs on the same day from re-spending quota on fixtures
+#: already analysed).
+PREDICTIONS_CACHE_TTL_HOURS = 6
+
+#: Reason string used whenever a live API-Football call is skipped
+#: because today's safety reserve is exhausted -- distinguishes this from
+#: a real transient network/HTTP error (never cached as final; see
+#: football_predictions.py).
+QUOTA_RESERVE_EXHAUSTED_REASON = "Резерв запросов к API-Football на сегодня исчерпан"
+
+# ---------------------------------------------------------------------------
+# Historical-baseline fallback (2026-07-14 production fix): when a fixture
+# has neither a real API-Football predictions answer nor real recent-form
+# data for either team (e.g. the daily quota reserve is exhausted and
+# nothing is cached yet for these specific teams), the fixture must still
+# be ranked rather than silently skipped. These are real, well-known
+# aggregate football statistics (global average outcome distribution and
+# average goals per match, reflecting home advantage) -- not fabricated
+# for a specific match. Candidates built from this fallback are always
+# capped at the LOW confidence tier (see prediction_selector.classify),
+# regardless of the raw probability number, because they carry zero
+# fixture-specific evidence.
+# ---------------------------------------------------------------------------
+
+#: Global historical outcome distribution across top football leagues
+#: (approximate, well-documented aggregate: home win / draw / away win).
+HISTORICAL_HOME_WIN_PROB = 0.45
+HISTORICAL_DRAW_PROB = 0.27
+HISTORICAL_AWAY_WIN_PROB = 0.28
+
+#: Historical average goals scored per match by the home/away side
+#: (reflects real, well-documented home-advantage goal split).
+HISTORICAL_AVG_GOALS_HOME = 1.45
+HISTORICAL_AVG_GOALS_AWAY = 1.15
+
+#: Completeness assigned to a fully historical-baseline candidate (no real
+#: fixture-specific evidence at all) -- low but non-zero, since it is real
+#: (if generic) data, not an invented number.
+HISTORICAL_FALLBACK_COMPLETENESS = 0.1
 
 #: Real, understandable betting markets this production version creates
 #: candidates for (Section 3 of the spec). Every key here must have a

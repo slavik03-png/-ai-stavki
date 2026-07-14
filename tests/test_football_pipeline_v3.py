@@ -113,13 +113,86 @@ def test_candidates_built_without_any_odds_data():
 
 def test_no_fabrication_when_data_missing():
     """No recent-form data at all for either team, and no predictions
-    endpoint answer -- must produce zero candidates, never a guessed
-    number."""
+    endpoint answer -- must fall back to the historical-baseline signal
+    (real, generic aggregate football statistics, never a fixture-
+    specific guess), always capped at "none" sample size / LOW tier, per
+    the 'never return analysed=0 when fixtures exist' requirement."""
     fixture = _fixture(2, "Nowhere FC", "Unknown United")
     provider = FakeProvider()  # every lookup returns Stat.missing
     cache = FootballCache(db_path=tempfile.mktemp(), now=NOW)
     candidates, _ = build_candidates_for_fixture(fixture, provider, cache)
-    check("zero candidates when API-Football has no real data for this fixture", candidates == [])
+    check("fixture still ranked via historical baseline, never dropped entirely", len(candidates) > 0)
+    check("every fallback candidate is honestly labelled as zero-evidence",
+          all(c.sample_size_category == "none" and c.source == "historical_baseline" for c in candidates))
+    from ai_predictions.prediction_selector import classify
+    check("fallback candidates can never classify above LOW",
+          all(classify(c.probability, c.completeness, c.sample_size_category) in (None, "LOW") for c in candidates))
+    cache.close()
+
+
+# ---------------------------------------------------------------------------
+# Regression: exhausted API-Football daily reserve must NOT abort analysis.
+# Cached fixtures keep producing full-confidence recommendations; fixtures
+# with nothing cached still get ranked via the historical baseline. Zero
+# real network calls are made once the reserve hits zero.
+# ---------------------------------------------------------------------------
+
+def test_reserve_exhausted_still_analyses_every_fixture_from_cache():
+    fixtures = [
+        _fixture(101, "Cached Home A", "Cached Away A", hours_ahead=2),
+        _fixture(102, "Cached Home B", "Cached Away B", hours_ahead=4),
+        _fixture(103, "Uncached Home C", "Uncached Away C", hours_ahead=6),
+    ]
+    cache = FootballCache(db_path=tempfile.mktemp(), now=NOW)
+
+    # Pre-populate the persistent cache exactly like a previous, successful
+    # run would have -- no network call is needed to read these back.
+    cache.set("predictions:101", {"available": True, "data": {
+        "percent": {"home": "78%", "draw": "12%", "away": "10%"}, "advice": None,
+        "under_over": None, "goals": {}, "win_or_draw": None, "winner_comment": None, "comparison": {},
+    }})
+    for team in ("Cached Home A", "Cached Away A", "Cached Home B", "Cached Away B"):
+        cache.set(f"team_recent_stats:{team.lower()}:8", {
+            "matches_counted": 8, "win_rate": 0.6, "avg_scored": 1.8, "avg_conceded": 0.8,
+            "available": True, "reason": None,
+        })
+    cache.set("predictions:102", {"available": True, "data": {
+        "percent": {"home": "68%", "draw": "17%", "away": "15%"}, "advice": None,
+        "under_over": None, "goals": {}, "win_or_draw": None, "winner_comment": None, "comparison": {},
+    }})
+
+    # Exhaust today's reserve entirely -- can_spend(1) must be False, and
+    # the provider must never receive a single real call from here on.
+    from ai_predictions.value_config import API_FOOTBALL_DAILY_QUOTA, API_FOOTBALL_QUOTA_RESERVE
+    cache.record_requests(API_FOOTBALL_DAILY_QUOTA - API_FOOTBALL_QUOTA_RESERVE)
+    check("reserve is genuinely exhausted for this test", not cache.can_spend(1))
+
+    class NetworkForbiddenProvider:
+        requests_made = 0
+
+        def get_predictions(self, fixture_id):
+            raise AssertionError("must not touch the network once the reserve is exhausted")
+
+        def get_last_matches(self, team, count=10):
+            raise AssertionError("must not touch the network once the reserve is exhausted")
+
+    provider = NetworkForbiddenProvider()
+    all_candidates = []
+    analysed = 0
+    for fixture in fixtures:
+        candidates, _ = build_candidates_for_fixture(fixture, provider, cache)
+        all_candidates.extend(candidates)
+        analysed += 1
+
+    check("every fixture is still analysed despite zero quota", analysed == len(fixtures))
+    ranked = select_recommendations(all_candidates)
+    check("cached fixtures still produce real, non-fallback recommendations",
+          any(r.candidate.source != "historical_baseline" for r in ranked))
+    check("the uncached fixture still gets a ranked (LOW, historical) candidate",
+          any(c.fixture.fixture_id == 103 for c in all_candidates))
+    check("uncached fixture's fallback candidates are honestly zero-evidence",
+          all(c.sample_size_category == "none" for c in all_candidates if c.fixture.fixture_id == 103))
+    check("no recommendation list is empty when fixtures > 0", len(ranked) > 0)
     cache.close()
 
 

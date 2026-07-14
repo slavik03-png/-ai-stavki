@@ -127,22 +127,31 @@ def run_football_predictions(
     from football.providers.api_football import ApiFootballProvider
     provider = ApiFootballProvider(api_key=football_api_key, now=now)
 
+    # Every fixture up to max_fixtures_analysed is always analysed --
+    # build_candidates_for_fixture never needs to be skipped wholesale:
+    # it reads persistent cache first, only spends real requests while
+    # football_cache.can_spend(1) allows it (per real HTTP call, not per
+    # fixture), and falls back to a historical-baseline signal when
+    # nothing real is available at all. This guarantees analysed_fixtures
+    # is never 0 while found_fixtures > 0 -- the daily quota reserve can
+    # only reduce *how much real data* backs each candidate, never how
+    # many fixtures get ranked.
     all_candidates: List[MarketCandidate] = []
     analysed = 0
+    quota_exhausted_during_run = False
     for fixture in fixture_discovery.fixtures[:max_fixtures_analysed]:
-        if not football_cache.can_spend(3):
-            result.errors.append(
-                f"Резерв запросов к API-Football исчерпан — проанализировано {analysed} из "
-                f"{len(fixture_discovery.fixtures)} найденных матчей"
-            )
-            break
-        before = provider.requests_made
+        if not football_cache.can_spend(1):
+            quota_exhausted_during_run = True
         candidates, _ = build_candidates_for_fixture(fixture, provider, football_cache)
-        spent = provider.requests_made - before
-        if spent:
-            football_cache.record_requests(spent)
         all_candidates.extend(candidates)
         analysed += 1
+
+    if quota_exhausted_during_run:
+        result.errors.append(
+            f"Резерв запросов к API-Football на сегодня исчерпан во время анализа — "
+            f"часть из {analysed} проанализированных матчей использует статистику из кэша "
+            f"или обобщённые исторические данные вместо свежих запросов."
+        )
 
     result.analysed_fixtures = analysed
     result.api_football_requests_used = provider.requests_made

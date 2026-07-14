@@ -30,7 +30,18 @@ from ai_predictions.fixtures import Fixture
 from ai_predictions.football_cache import FootballCache
 from ai_predictions.goal_model import estimate_total_goals_probabilities
 from ai_predictions.probability_model import sample_size_category, statistics_probability_for_side
-from ai_predictions.value_config import BET_MARKET_LABELS_RU
+from ai_predictions.value_config import (
+    BET_MARKET_LABELS_RU,
+    HISTORICAL_AVG_GOALS_AWAY,
+    HISTORICAL_AVG_GOALS_HOME,
+    HISTORICAL_AWAY_WIN_PROB,
+    HISTORICAL_DRAW_PROB,
+    HISTORICAL_FALLBACK_COMPLETENESS,
+    HISTORICAL_HOME_WIN_PROB,
+    PREDICTIONS_CACHE_TTL_HOURS,
+    QUOTA_RESERVE_EXHAUSTED_REASON,
+)
+from football.interface import Stat
 from football.providers.api_football import ApiFootballProvider
 
 #: How many recent finished matches to sample per team -- enough for a
@@ -67,21 +78,42 @@ class TeamRecentStats:
     reason: Optional[str] = None
 
 
+def _spend_and_call(provider: ApiFootballProvider, cache: FootballCache, fn, *args, **kwargs) -> Stat:
+    """Only spends real API-Football requests while today's safety
+    reserve allows it. A cache MISS that also has no budget left returns
+    Stat.missing(QUOTA_RESERVE_EXHAUSTED_REASON) without touching the
+    network -- callers must treat this exactly like any other missing
+    data (fall back to a lower-confidence signal), never abort the whole
+    fixture/run."""
+    if not cache.can_spend(1):
+        return Stat.missing(QUOTA_RESERVE_EXHAUSTED_REASON)
+    before = provider.requests_made
+    result = fn(*args, **kwargs)
+    spent = provider.requests_made - before
+    if spent:
+        cache.record_requests(spent)
+    return result
+
+
 def _team_recent_stats(provider: ApiFootballProvider, cache: FootballCache, team: str) -> TeamRecentStats:
     """One real, 24h-cached bundle per team: win rate + average
     scored/conceded goals over `RECENT_MATCHES_COUNT` real finished
     matches. Cached persistently so a team appearing in several of this
     run's fixtures (or a later run within 24h) never re-triggers the
-    network call."""
+    network call. A cache MISS is only ever escalated to a real network
+    call while today's quota reserve allows it -- once exhausted, this
+    returns "unavailable" (never blocking the fixture, only this one
+    ingredient of it)."""
     cache_key = f"team_recent_stats:{team.strip().lower()}:{RECENT_MATCHES_COUNT}"
     cached = cache.get(cache_key)
     if cached is not None:
         return TeamRecentStats(**cached)
 
-    stat = provider.get_last_matches(team, count=RECENT_MATCHES_COUNT)
+    stat = _spend_and_call(provider, cache, provider.get_last_matches, team, count=RECENT_MATCHES_COUNT)
     if not stat.available:
-        # Transient errors are not cached here either -- same rule as the
-        # provider's own per-run caches (never cache a "not found yet").
+        # Transient errors (including quota-reserve exhaustion) are not
+        # cached here either -- same rule as the provider's own per-run
+        # caches (never cache a "not found yet").
         return TeamRecentStats(available=False, reason=stat.reason)
 
     matches = stat.value
@@ -130,6 +162,88 @@ def _parse_percent(raw: Optional[str]) -> Optional[float]:
         return None
 
 
+def _predictions_for_fixture(fixture: Fixture, provider: ApiFootballProvider, cache: FootballCache) -> Stat:
+    """Real `/predictions` answer for this fixture, persistently cached
+    for PREDICTIONS_CACHE_TTL_HOURS so repeated runs on the same day never
+    re-spend quota on a fixture already analysed. A cache MISS only
+    escalates to a real network call while today's quota reserve allows
+    it (see _spend_and_call) -- once exhausted, this fixture simply
+    proceeds without a predictions-endpoint opinion, never blocking it."""
+    cache_key = f"predictions:{fixture.fixture_id}"
+    cached = cache.get(cache_key, ttl_hours=PREDICTIONS_CACHE_TTL_HOURS)
+    if cached is not None:
+        if cached.get("available"):
+            return Stat.ok(cached["data"])
+        return Stat.missing(cached.get("reason") or "Прогноз недоступен (по данным кэша)")
+
+    stat = _spend_and_call(provider, cache, provider.get_predictions, fixture.fixture_id)
+    if stat.reason == QUOTA_RESERVE_EXHAUSTED_REASON:
+        # Transient (no budget left this run) -- do not persist, a later
+        # run today (or tomorrow) may still get a real answer.
+        return stat
+    if stat.available:
+        cache.set(cache_key, {"available": True, "data": stat.value})
+    else:
+        # A confirmed real "no predictions for this fixture" answer (the
+        # provider only reaches this branch after a successful HTTP call
+        # -- see ApiFootballProvider.get_predictions) is worth caching so
+        # we don't keep re-asking API-Football the same question.
+        cache.set(cache_key, {"available": False, "reason": stat.reason})
+    return stat
+
+
+def _historical_baseline_candidates(fixture: Fixture) -> List[MarketCandidate]:
+    """Last-resort fallback when NEITHER the predictions endpoint NOR
+    either team's recent form could be retrieved (no cache hit and no
+    quota left). Uses real, well-documented aggregate football statistics
+    (see value_config.HISTORICAL_*) -- never fabricated for this specific
+    match -- so the fixture is still ranked instead of silently dropped.
+    Always carries sample_size_category="none", which caps it at the LOW
+    confidence tier regardless of the raw probability (see
+    prediction_selector.classify)."""
+    candidates: List[MarketCandidate] = []
+    rationale = (
+        "Статистика по этому матчу недоступна (исчерпан дневной резерв запросов "
+        "к API-Football и данные ещё не кэшированы) — используется обобщённая "
+        "историческая статистика, уверенность снижена."
+    )
+    entries = [
+        ("home_win", HISTORICAL_HOME_WIN_PROB),
+        ("draw", HISTORICAL_DRAW_PROB),
+        ("away_win", HISTORICAL_AWAY_WIN_PROB),
+        ("double_chance_1x", HISTORICAL_HOME_WIN_PROB + HISTORICAL_DRAW_PROB),
+        ("double_chance_x2", HISTORICAL_AWAY_WIN_PROB + HISTORICAL_DRAW_PROB),
+    ]
+    for market_key, probability in entries:
+        candidates.append(MarketCandidate(
+            fixture=fixture,
+            market_key=market_key,
+            market_label_ru=BET_MARKET_LABELS_RU[market_key],
+            probability=max(0.0, min(1.0, probability)),
+            completeness=HISTORICAL_FALLBACK_COMPLETENESS,
+            sample_size_category="none",
+            rationale=rationale,
+            source="historical_baseline",
+        ))
+
+    goals = estimate_total_goals_probabilities(HISTORICAL_AVG_GOALS_HOME, HISTORICAL_AVG_GOALS_AWAY)
+    for market_key, probability in (
+        ("over_1_5", goals.over_1_5), ("over_2_5", goals.over_2_5), ("under_3_5", goals.under_3_5),
+        ("btts_yes", goals.btts_yes), ("btts_no", goals.btts_no),
+    ):
+        candidates.append(MarketCandidate(
+            fixture=fixture,
+            market_key=market_key,
+            market_label_ru=BET_MARKET_LABELS_RU[market_key],
+            probability=max(0.0, min(1.0, probability)),
+            completeness=HISTORICAL_FALLBACK_COMPLETENESS,
+            sample_size_category="none",
+            rationale=rationale,
+            source="historical_baseline",
+        ))
+    return candidates
+
+
 def _completeness_for(*, has_predictions_percent: bool, home_stats: TeamRecentStats, away_stats: TeamRecentStats) -> float:
     """0..1 -- how much of this market's evidence is real, retrieved data
     at (near-)full sample size. A market missing recent-form entirely
@@ -161,7 +275,7 @@ def build_candidates_for_fixture(
     caller (football_pipeline.py) reads directly."""
     candidates: List[MarketCandidate] = []
 
-    predictions_stat = provider.get_predictions(fixture.fixture_id)
+    predictions_stat = _predictions_for_fixture(fixture, provider, cache)
     percent_home = percent_draw = percent_away = None
     predictions_available = False
     if predictions_stat.available:
@@ -244,5 +358,16 @@ def build_candidates_for_fixture(
                 rationale=rationale,
                 source="goal_model",
             ))
+
+    # -- historical-baseline fallback -----------------------------------------
+    # Reached only when NOTHING real was retrieved for this fixture at all
+    # (no predictions endpoint answer, no team-derived 1X2 estimate, and no
+    # totals/BTTS model) -- e.g. quota reserve exhausted and neither team
+    # has any cached data yet. Per the "never return zero analysis when
+    # fixtures exist" requirement, the fixture is still ranked using real,
+    # generic historical statistics instead of being skipped, always capped
+    # at LOW confidence (sample_size_category="none").
+    if not candidates:
+        candidates.extend(_historical_baseline_candidates(fixture))
 
     return candidates, provider.requests_made

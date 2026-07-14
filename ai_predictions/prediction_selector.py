@@ -37,10 +37,19 @@ from ai_predictions.value_config import (
 MAX_RECOMMENDATIONS = 5
 
 
-def classify(probability: float, completeness: float) -> Optional[str]:
+def classify(probability: float, completeness: float, sample_size_category: str = "strong") -> Optional[str]:
     """Returns HIGH/MEDIUM/LOW, or None if the candidate does not even
-    reach the LOW threshold (in which case it must not be shown at
-    all)."""
+    reach the LOW threshold (in which case it must not be shown at all).
+
+    `sample_size_category == "none"` means the candidate carries ZERO
+    fixture-specific evidence (the historical-baseline fallback -- see
+    football_predictions._historical_baseline_candidates). Such a
+    candidate is always capped at LOW, regardless of its raw probability,
+    because a generic aggregate statistic (e.g. "home win or draw ~72%
+    globally") must never be presented with HIGH/MEDIUM confidence as if
+    it were derived from this specific match."""
+    if sample_size_category == "none":
+        return SIGNAL_LOW if probability >= PROB_LOW_MIN else None
     if probability >= PROB_HIGH_MIN and completeness >= PROB_HIGH_MIN_COMPLETENESS:
         return SIGNAL_HIGH
     if probability >= PROB_MEDIUM_MIN:
@@ -73,7 +82,7 @@ def select_recommendations(all_candidates: List[MarketCandidate]) -> List[Ranked
     per_fixture = best_candidate_per_fixture(all_candidates)
     ranked: List[RankedRecommendation] = []
     for c in per_fixture:
-        level = classify(c.probability, c.completeness)
+        level = classify(c.probability, c.completeness, c.sample_size_category)
         if level is None:
             continue
         ranked.append(RankedRecommendation(candidate=c, signal_level=level))
