@@ -72,3 +72,35 @@ never hard-code an EV/edge/bookmaker-count number anywhere else.
   ranking_score (closest to a real threshold) instead of an empty report.
   Do not regress to "up to 5 per level, 15 max" — that was the earlier,
   now-replaced design.
+
+## Fixture-discovery-first architecture (as of 2026-07-14, supersedes odds-only-first)
+
+The pipeline order changed from "scan Odds API leagues → build candidates"
+to: discover real fixtures from API-Football for the strict window first
+(`ai_predictions/fixtures.py`, date-based `/fixtures?date=`, not
+season-based — see api-football-free-plan-limits.md) → scope which Odds
+API sport_keys are worth querying from those fixtures' leagues/countries
+(`ai_predictions/league_relevance.py`, textual relevance, never a fixed
+list) → fetch odds only for that scoped set → match fixtures to odds
+events by team-name confidence + kickoff proximity, dropping ambiguous
+pairs (`ai_predictions/fixture_matching.py`) → build value candidates only
+from matched events → blend market probability with real recent-form
+statistics via a sample-size-weighted table (`ai_predictions/
+probability_model.py`, weights in `value_config.PROBABILITY_BLEND_WEIGHTS`)
+→ `value_engine.apply_probability_blend` recomputes edge/EV and can move a
+candidate between tiers only when real statistics contributed (never on a
+market-only blend).
+
+**Why:** the older approach trusted whatever Odds API happened to return
+as "the fixtures for today," which could include events with no real
+API-Football counterpart to enrich, and could not scope Odds API queries
+to relevant leagues without already knowing which real matches exist.
+
+**How to apply:** any future change to fixture/odds matching or the
+probability blend must preserve the "never guess, only skip" rule at each
+join: unmatched/ambiguous fixtures and events are counted and reported,
+never silently dropped or paired by best-effort guess. The Odds API's own
+quota can be exhausted independently of API-Football's — a run can have
+real fixtures (`fixtures_discovered > 0`) with zero odds
+(`odds_quota_exhausted=True`); this is a distinct, honestly-reported
+condition, not "no matches found."

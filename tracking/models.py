@@ -126,6 +126,15 @@ class Prediction:
     statistics_score: Optional[float] = None
     final_combined_score: Optional[float] = None
 
+    # -- fixture-discovery-first pipeline (optional, backward compatible:
+    #    rows saved before this feature existed simply leave these at
+    #    their defaults). --
+    fixture_id: Optional[int] = None
+    matching_confidence: Optional[float] = None
+    sample_size_category: Optional[str] = None
+    market_probability: Optional[float] = None
+    statistics_probability: Optional[float] = None
+
     def __post_init__(self) -> None:
         if self.recommendation_group not in RECOMMENDATION_GROUPS:
             raise ValueError(

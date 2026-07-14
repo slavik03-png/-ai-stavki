@@ -36,7 +36,7 @@ def test_parse_returns_none_for_unrelated_error_body():
 def test_fetch_retries_with_remaining_markets_on_422(monkeypatch=None):
     calls = []
 
-    def fake_fetch(sport_key, api_key, markets):
+    def fake_fetch(sport_key, api_key, markets, persistent_cache=None):
         calls.append(markets)
         if markets == odds_client_mod.PREFERRED_MARKETS:
             body = '{"message":"Markets not supported by this endpoint: btts, double_chance, draw_no_bet, team_totals"}'

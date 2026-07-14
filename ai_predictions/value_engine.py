@@ -106,6 +106,19 @@ MIN_EDGE = LOW_MIN_EDGE
 MAX_MAIN_RECOMMENDATIONS = 5
 
 
+def _effective_edge(candidate: "ValueCandidate") -> float:
+    """The blended edge (Phase 6) once real statistics were folded in,
+    falling back to the pure-market edge for any candidate that was never
+    blended (no fixture match, no usable statistics, or a market
+    statistics has no opinion on) -- an odds-only candidate behaves
+    exactly as before this feature existed."""
+    return candidate.edge_final if candidate.edge_final is not None else candidate.edge
+
+
+def _effective_ev(candidate: "ValueCandidate") -> float:
+    return candidate.expected_value_final if candidate.expected_value_final is not None else candidate.expected_value
+
+
 @dataclass
 class ValueCandidate:
     event_id: str
@@ -163,6 +176,21 @@ class ValueCandidate:
     statistics_completeness: float = 0.0  # 0..1, how much of the needed real data was retrieved
     statistics_score: Optional[float] = None  # 0..1, 0.5 = neutral/no opinion; None until computed
     final_combined_score: Optional[float] = None  # ranking_score nudged by statistics_score; None if never enriched
+
+    # -- Phase 4/6 fixture-discovery-first pipeline: the real API-Football
+    #    fixture this candidate's event was matched to, and the auditable
+    #    market+statistics probability blend computed from it. All None
+    #    until fixture matching/enrichment actually ran for this candidate;
+    #    None never means "computed as zero", only "not attempted". --
+    fixture_id: Optional[int] = None
+    fixture_match_confidence: Optional[float] = None
+    market_probability: Optional[float] = None
+    statistics_probability: Optional[float] = None
+    estimated_probability: Optional[float] = None  # blended; falls back to consensus_probability if never blended
+    fair_odds_blended: Optional[float] = None
+    edge_final: Optional[float] = None  # falls back to `edge` in classify_signal/ranking when None
+    expected_value_final: Optional[float] = None  # falls back to `expected_value` when None
+    sample_size_category: str = "none"  # none|weak|medium|strong
 
     def __post_init__(self) -> None:
         if not self.generated_at:
@@ -246,12 +274,15 @@ def classify_signal(candidate: ValueCandidate) -> "tuple[str, List[str], Optiona
             f"{OUTLIER_PRICE_GAP_THRESHOLD * 100:.0f}% выше второй лучшей цены — возможен изолированный выброс."
         )
 
+    effective_ev = _effective_ev(candidate)
+    effective_edge = _effective_edge(candidate)
+
     def meets(min_bm: int, min_ev: float, min_edge: float) -> bool:
         return (
             base_ok
             and candidate.unique_bookmaker_count >= min_bm
-            and candidate.expected_value >= min_ev
-            and candidate.edge >= min_edge
+            and effective_ev >= min_ev
+            and effective_edge >= min_edge
         )
 
     if meets(HIGH_MIN_BOOKMAKERS, HIGH_MIN_EV, HIGH_MIN_EDGE):
@@ -283,10 +314,10 @@ def classify_signal(candidate: ValueCandidate) -> "tuple[str, List[str], Optiona
             reasons.append(
                 f"Только {candidate.unique_bookmaker_count} букмекер(ов) по этому исходу — нужно минимум {LOW_MIN_BOOKMAKERS}"
             )
-        if candidate.expected_value < LOW_MIN_EV:
-            reasons.append(f"Ожидаемая ценность {candidate.expected_value:.3f} ниже минимума +{LOW_MIN_EV:.2f}")
-        if candidate.edge < LOW_MIN_EDGE:
-            reasons.append(f"Расхождение {candidate.edge:.3f} ниже минимума +{LOW_MIN_EDGE:.2f}")
+        if effective_ev < LOW_MIN_EV:
+            reasons.append(f"Ожидаемая ценность {effective_ev:.3f} ниже минимума +{LOW_MIN_EV:.2f}")
+        if effective_edge < LOW_MIN_EDGE:
+            reasons.append(f"Расхождение {effective_edge:.3f} ниже минимума +{LOW_MIN_EDGE:.2f}")
 
     if candidate.unique_bookmaker_count == 2 and level in (SIGNAL_MEDIUM, SIGNAL_LOW):
         reasons.append("Только 2 независимых букмекера — сниженная уверенность.")
@@ -319,13 +350,43 @@ def compute_ranking_score(candidate: ValueCandidate) -> float:
     outlier_term = RANKING_OUTLIER_PENALTY if candidate.is_outlier else 0.0
 
     score = (
-        candidate.expected_value * RANKING_WEIGHT_EV
-        + candidate.edge * RANKING_WEIGHT_EDGE
+        _effective_ev(candidate) * RANKING_WEIGHT_EV
+        + _effective_edge(candidate) * RANKING_WEIGHT_EDGE
         + bookmaker_term
         - dispersion_term
         - outlier_term
     )
     return round(score, 4)
+
+
+def apply_probability_blend(candidate: ValueCandidate, blend: "object") -> None:
+    """Applies a probability_model.BlendResult to `candidate` in place:
+    sets the auditable probability fields and, only for a selection
+    statistics actually has a real opinion on (statistics_probability is
+    not None), recomputes edge_final/expected_value_final from the
+    blended probability. Re-classifies and re-scores the candidate so the
+    blend can actually move it between HIGH/MEDIUM/LOW/REJECTED -- this is
+    the one place blending is allowed to change the tier (unlike the
+    older, market-only compute_combined_score nudge)."""
+    candidate.market_probability = blend.market_probability
+    candidate.statistics_probability = blend.statistics_probability
+    candidate.estimated_probability = blend.estimated_probability
+    candidate.sample_size_category = blend.sample_size_category
+    candidate.fair_odds_blended = (1.0 / blend.estimated_probability) if blend.estimated_probability > 0 else None
+
+    if blend.statistics_probability is not None:
+        candidate.edge_final = blend.estimated_probability - candidate.best_price_implied_probability
+        candidate.expected_value_final = (blend.estimated_probability * candidate.best_price) - 1.0
+    else:
+        candidate.edge_final = None
+        candidate.expected_value_final = None
+
+    level, reasons, outlier_warning = classify_signal(candidate)
+    candidate.signal_level = level
+    candidate.rejection_reasons = reasons
+    candidate.outlier_warning = outlier_warning
+    candidate.ranking_score = compute_ranking_score(candidate)
+    candidate.final_combined_score = compute_combined_score(candidate)
 
 
 def compute_combined_score(candidate: ValueCandidate) -> float:

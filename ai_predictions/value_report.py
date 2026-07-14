@@ -130,12 +130,37 @@ class Diagnostics:
     api_football_season_allowed: bool = False
     api_football_skipped_reason: "str | None" = None
 
+    # -- Phase 1/4 fixture-discovery-first diagnostics --
+    fixtures_discovered: int = 0
+    fixtures_excluded_by_window: int = 0
+    fixtures_excluded_by_status: int = 0
+    fixtures_matched_to_odds: int = 0
+    fixtures_unmatched: int = 0
+    fixtures_ambiguous: int = 0
+    odds_events_unmatched: int = 0
+    odds_quota_exhausted: bool = False
+    odds_stale_fallback: bool = False
+
     def as_lines(self) -> List[str]:
         lines = [
-            f"Активных футбольных турниров обнаружено: {len(self.sports_discovered)}",
-            f"Турниров успешно опрошено: {len(self.sports_queried)}",
-            f"Турниров пропущено: {len(self.sports_skipped)}",
+            f"Реальных фикстур обнаружено (API-Football, окно 36ч): {self.fixtures_discovered}",
+            f"Фикстур исключено (вне окна/статус): "
+            f"{self.fixtures_excluded_by_window + self.fixtures_excluded_by_status}",
+            f"Фикстур сопоставлено с котировками: {self.fixtures_matched_to_odds}",
+            f"Фикстур без котировок: {self.fixtures_unmatched}",
+            f"Неоднозначных сопоставлений (пропущены, не угаданы): {self.fixtures_ambiguous}",
+            f"Событий The Odds API без сопоставленной фикстуры: {self.odds_events_unmatched}",
         ]
+        if self.odds_quota_exhausted:
+            lines.append(
+                "⚠️ Квота The Odds API исчерпана"
+                + (" — использованы последние сохранённые (устаревшие) котировки." if self.odds_stale_fallback else " — свежие котировки недоступны в этом запуске.")
+            )
+        lines.extend([
+            f"Активных футбольных турниров обнаружено (каталог The Odds API): {len(self.sports_discovered)}",
+            f"Турниров опрошено (по релевантности к фикстурам): {len(self.sports_queried)}",
+            f"Турниров пропущено: {len(self.sports_skipped)}",
+        ])
         if self.discovery_source == "fallback_hardcoded":
             lines.append(
                 f"⚠️ Живой список видов спорта The Odds API недоступен "
@@ -260,6 +285,8 @@ def _render_telegram_card(candidate: ValueCandidate, index: int) -> str:
     lines.append(f"🕒 {_fmt_local_time(candidate.match_datetime)}")
     lines.append(f"🎯 {_selection_display_ru(candidate)}")
     lines.append(f"📈 {candidate.best_price:.2f}")
+    if candidate.estimated_probability is not None:
+        lines.append(f"📐 Расчётная вероятность: {candidate.estimated_probability * 100:.0f}%")
     lines.append(f"📊 Уровень сигнала: {label.split(' ', 1)[-1]}")
     lines.append(f"📝 {_short_risk_note(candidate)}")
     if candidate.signal_level == "LOW":
@@ -283,7 +310,18 @@ def render_telegram_signals_message(result: ValueSelectionResult, diagnostics: D
     )
 
     if not result.top_signals:
-        body = "На ближайшие 36 часов подходящих сигналов не найдено."
+        if diagnostics.fixtures_discovered == 0:
+            body = "На ближайшие 36 часов не найдено ни одного реального матча."
+        elif diagnostics.events_received == 0:
+            body = (
+                "Матчи есть, но сейчас недоступны коэффициенты букмекеров "
+                "(квота данных исчерпана)." if diagnostics.odds_quota_exhausted
+                else "Матчи есть, но сейчас недоступны коэффициенты букмекеров для этих турниров."
+            )
+        elif diagnostics.fixtures_matched_to_odds == 0:
+            body = "Матчи и коэффициенты есть, но их не удалось надёжно сопоставить друг с другом."
+        else:
+            body = "На ближайшие 36 часов подходящих сигналов не найдено."
         return [f"{header}\n\n{body}\n\n{summary}"]
 
     cards = [_render_telegram_card(c, i) for i, c in enumerate(result.top_signals, start=1)]
@@ -373,15 +411,26 @@ def render_value_report(result: ValueSelectionResult, diagnostics: Diagnostics) 
     if not result.top_signals:
         lines.append("Сегодня нет сигналов ни одного уровня (HIGH/MEDIUM/LOW).\n")
         lines.append("Причины:")
-        if diagnostics.events_in_window == 0:
+        if diagnostics.fixtures_discovered == 0:
             lines.append(
-                f"- Нет ни одного события в ближайшие 36 часов (событий получено всего: "
-                f"{diagnostics.events_received}, все исключены окном 36ч, "
-                f"турниров опрошено: {len(diagnostics.sports_queried)}). Это не ошибка сопоставления "
-                f"— рынок просто не предлагает матчей в этом окне прямо сейчас."
+                "- Нет ни одной реальной фикстуры в ближайшие 36 часов по данным API-Football "
+                "(окно Екатеринбург/UTC). Это не ошибка — рынок просто не предлагает матчей в этом окне прямо сейчас."
+            )
+        elif diagnostics.events_received == 0:
+            reason = "квота The Odds API исчерпана" if diagnostics.odds_quota_exhausted else "котировки букмекеров недоступны для обнаруженных турниров прямо сейчас"
+            lines.append(
+                f"- Обнаружено {diagnostics.fixtures_discovered} реальных фикстур, но {reason} "
+                f"— нет данных для сравнения коэффициентов."
+            )
+        elif diagnostics.fixtures_matched_to_odds == 0:
+            lines.append(
+                f"- Обнаружено {diagnostics.fixtures_discovered} реальных фикстур и "
+                f"{diagnostics.events_in_window} событий с котировками, но ни одна пара не сопоставлена "
+                f"с достаточной уверенностью (без сопоставления: {diagnostics.fixtures_unmatched}, "
+                f"неоднозначных: {diagnostics.fixtures_ambiguous})."
             )
         elif diagnostics.candidates_created == 0:
-            lines.append("- Не найдено ни одного реального исхода с котировками нескольких букмекеров в событиях внутри окна 36 часов.")
+            lines.append("- Не найдено ни одного реального исхода с котировками нескольких букмекеров в сопоставленных событиях.")
         else:
             for reason in diagnostics.top_rejection_reasons[:8]:
                 lines.append(f"- {reason}")

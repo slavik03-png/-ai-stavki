@@ -18,6 +18,13 @@ curl `/fixtures?team=<id>&season=<current_year>` directly and read `errors` befo
 requires an upgraded API-Football plan (or restructuring around a different real signal, e.g. cross-bookmaker
 price-dispersion value betting instead of team-strength stats) — it is a plan/product decision, not a patch.
 
+**Correction (2026-07-14): the season restriction does NOT apply to date-based fixture discovery.** Confirmed live:
+`/fixtures?date=YYYY-MM-DD` (used for real fixture discovery — no `season`/`last`/`next` param) returns real
+fixtures on the free plan for the *current* date range with no errors; a live production run discovered 232 real
+fixtures in a 36h window this way. Only `season`/`last`/`next`-based queries hit the restriction above. So: use
+`/fixtures?date=` as the primary source of truth for "what real matches exist right now", and reserve the
+season-gate check above for the team-stats/form endpoints that actually take a `season` param.
+
 **Season-gate design (activated as an *enrichment* on top of odds-only value betting, not a replacement):**
 check the computed season against the allowed set *before* spending any quota; if it's out of range, skip every
 API-Football HTTP call for the whole run (0 requests) and mark affected candidates honestly (e.g.

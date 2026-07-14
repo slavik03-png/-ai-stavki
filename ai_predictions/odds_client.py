@@ -39,6 +39,19 @@ ODDS_FORMAT = "decimal"
 #: The Odds API's own grouping label for every football/soccer competition.
 FOOTBALL_GROUP = "Soccer"
 
+#: Prefix used to flag an error message as "the plan/quota was exhausted"
+#: (HTTP 401 + The Odds API's own OUT_OF_USAGE_CREDITS error_code) rather
+#: than a generic failure -- callers use this to report the honest reason
+#: ("no bookmaker credits left to refresh odds") instead of a vague error,
+#: and to decide whether falling back to a persisted last-known-good
+#: response is appropriate.
+QUOTA_EXHAUSTED_MARKER = "ODDS_API_QUOTA_EXHAUSTED"
+
+#: Prefix used when a persisted (up to 24h old) response was returned
+#: because the live call failed with QUOTA_EXHAUSTED_MARKER -- the caller
+#: must report this data as stale, never as a fresh live price.
+STALE_ODDS_MARKER = "ODDS_API_STALE_FALLBACK"
+
 #: Fallback-only list, used exclusively when the live `/sports` discovery
 #: call fails outright (network error, non-200, bad JSON) -- NOT the
 #: normal source of truth for which leagues get queried any more.
@@ -152,6 +165,8 @@ def _fetch_one_league_uncached(
     credits = response.headers.get("x-requests-remaining")
     if response.status_code != 200:
         body = response.text
+        if response.status_code == 401 and "OUT_OF_USAGE_CREDITS" in body:
+            return None, credits, f"{QUOTA_EXHAUSTED_MARKER}: квота The Odds API исчерпана ({sport_key})", body
         return None, credits, f"The Odds API вернул HTTP {response.status_code} для {sport_key}", body
     try:
         events = response.json()
@@ -161,13 +176,20 @@ def _fetch_one_league_uncached(
 
 
 def _fetch_one_league(
-    sport_key: str, api_key: str, markets: str
+    sport_key: str, api_key: str, markets: str, persistent_cache: Optional[Any] = None,
 ) -> "Tuple[Optional[List[Dict[str, Any]]], Optional[str], Optional[str], Optional[str]]":
     """Cached wrapper (Step 13) around the real network call: reuses a
     confirmed-successful response for the same (sport_key, markets) within
     EVENTS_CACHE_TTL_SECONDS instead of issuing a duplicate real request.
     An error is never cached -- only success -- so a transient failure
-    always gets a fresh retry on the next call."""
+    always gets a fresh retry on the next call.
+
+    When `persistent_cache` is given (a 24h SQLite cache surviving process
+    restarts, see ai_predictions/football_cache.py), a confirmed-successful
+    response is also stored there; if the real call then fails with the
+    quota-exhausted marker, the persisted last-known-good response is
+    returned instead of a hard failure, clearly flagged as stale via the
+    error string so callers can report it honestly rather than silently."""
     cached = _cache_get_events(sport_key, markets)
     if cached is not None:
         events, credits = cached
@@ -175,12 +197,20 @@ def _fetch_one_league(
     events, credits, error, body = _fetch_one_league_uncached(sport_key, api_key, markets)
     if error is None:
         _cache_set_events(sport_key, markets, events, credits)
+        if persistent_cache is not None:
+            persistent_cache.set(f"odds:events:{sport_key}:{markets}", events)
+        return events, credits, error, body
+    if persistent_cache is not None and QUOTA_EXHAUSTED_MARKER in (error or ""):
+        stale = persistent_cache.get(f"odds:events:{sport_key}:{markets}")
+        if stale is not None:
+            return stale, credits, f"{STALE_ODDS_MARKER}: {error}", body
     return events, credits, error, body
 
 
 def fetch_football_events(
     api_key: Optional[str] = None,
     sport_keys: Optional[List[str]] = None,
+    persistent_cache: Optional[Any] = None,
 ) -> "Tuple[List[Dict[str, Any]], Optional[str], List[str]]":
     """Fetches raw event JSON (full bookmaker/market/outcome tree, not
     flattened) for every football league. Returns
@@ -197,8 +227,8 @@ def fetch_football_events(
     errors: List[str] = []
 
     for sport_key in sport_keys:
-        events, credits, error, body = _fetch_one_league(sport_key, api_key, PREFERRED_MARKETS)
-        if error:
+        events, credits, error, body = _fetch_one_league(sport_key, api_key, PREFERRED_MARKETS, persistent_cache)
+        if error and STALE_ODDS_MARKER not in error:
             unsupported = _parse_unsupported_markets(body or "")
             if unsupported:
                 # The API told us exactly which markets it will not serve
@@ -207,15 +237,16 @@ def fetch_football_events(
                 # market (e.g. team_totals) is unavailable on this plan.
                 remaining = [m for m in PREFERRED_MARKETS.split(",") if m not in unsupported]
                 retry_markets = ",".join(remaining) if remaining else FALLBACK_MARKETS
-                events, credits, error, body = _fetch_one_league(sport_key, api_key, retry_markets)
-            if error:
+                events, credits, error, body = _fetch_one_league(sport_key, api_key, retry_markets, persistent_cache)
+            if error and STALE_ODDS_MARKER not in error:
                 # Last resort: the minimal, near-universally-supported set.
-                events, credits, error, body = _fetch_one_league(sport_key, api_key, FALLBACK_MARKETS)
+                events, credits, error, body = _fetch_one_league(sport_key, api_key, FALLBACK_MARKETS, persistent_cache)
         if credits is not None:
             credits_remaining = credits
         if error:
             errors.append(error)
-            continue
+            if STALE_ODDS_MARKER not in error:
+                continue
         for event in events or []:
             event["_sport_key"] = sport_key
             all_events.append(event)
@@ -223,12 +254,16 @@ def fetch_football_events(
     return all_events, credits_remaining, errors
 
 
-def fetch_active_sports(api_key: Optional[str] = None) -> "Tuple[Optional[List[Dict[str, Any]]], Optional[str]]":
+def fetch_active_sports(
+    api_key: Optional[str] = None, persistent_cache: Optional[Any] = None,
+) -> "Tuple[Optional[List[Dict[str, Any]]], Optional[str]]":
     """Fetches the live catalog of active sports/competitions from The
     Odds API (GET /v4/sports) -- this is the real, current list the API
     is covering right now, not anything hardcoded. Cached for
     SPORTS_LIST_CACHE_TTL_SECONDS. Returns (sports_or_None, error_or_None);
-    never caches a failed response."""
+    never caches a failed response. When `persistent_cache` is given and
+    the live call fails, a persisted (up to 24h old) catalog is used as a
+    last resort so quota exhaustion never means zero football coverage."""
     api_key = api_key or _get_odds_api_key()
     if not api_key:
         return None, "Не найден ODDS_API_KEY"
@@ -240,16 +275,32 @@ def fetch_active_sports(api_key: Optional[str] = None) -> "Tuple[Optional[List[D
     try:
         response = requests.get(SPORTS_LIST_ENDPOINT, params={"apiKey": api_key}, timeout=30)
     except requests.RequestException as exc:
-        return None, f"Сетевая ошибка The Odds API (список видов спорта): {exc}"
+        error = f"Сетевая ошибка The Odds API (список видов спорта): {exc}"
+        return _sports_list_stale_fallback(persistent_cache, error)
     if response.status_code != 200:
-        return None, f"The Odds API вернул HTTP {response.status_code} для списка видов спорта"
+        error = f"The Odds API вернул HTTP {response.status_code} для списка видов спорта"
+        if response.status_code == 401 and "OUT_OF_USAGE_CREDITS" in response.text:
+            error = f"{QUOTA_EXHAUSTED_MARKER}: квота The Odds API исчерпана (список видов спорта)"
+        return _sports_list_stale_fallback(persistent_cache, error)
     try:
         data = response.json()
     except ValueError:
-        return None, "The Odds API вернул некорректный JSON для списка видов спорта"
+        return _sports_list_stale_fallback(persistent_cache, "The Odds API вернул некорректный JSON для списка видов спорта")
 
     _cache_set_sports_list(data)
+    if persistent_cache is not None:
+        persistent_cache.set("odds:sports_catalog", data)
     return data, None
+
+
+def _sports_list_stale_fallback(
+    persistent_cache: Optional[Any], error: str,
+) -> "Tuple[Optional[List[Dict[str, Any]]], Optional[str]]":
+    if persistent_cache is not None:
+        stale = persistent_cache.get("odds:sports_catalog")
+        if stale is not None:
+            return stale, f"{STALE_ODDS_MARKER}: {error}"
+    return None, error
 
 
 @dataclass
@@ -265,7 +316,7 @@ class SportsDiscovery:
     source: str = "api"  # "api" or "fallback_hardcoded"
 
 
-def discover_football_sport_keys(api_key: Optional[str] = None) -> SportsDiscovery:
+def discover_football_sport_keys(api_key: Optional[str] = None, persistent_cache: Optional[Any] = None) -> SportsDiscovery:
     """Discovers every currently active football (soccer) competition The
     Odds API is covering right now -- lower leagues and minor cups
     included whenever the API lists them as active -- instead of a fixed
@@ -280,8 +331,12 @@ def discover_football_sport_keys(api_key: Optional[str] = None) -> SportsDiscove
     Falls back to the previous hardcoded 7-league list ONLY if the live
     `/sports` call itself fails outright, so a transient API/network
     hiccup never means zero football coverage for the run."""
-    sports, error = fetch_active_sports(api_key)
-    if error or not sports:
+    sports, error = fetch_active_sports(api_key, persistent_cache)
+    if error and STALE_ODDS_MARKER in error and sports:
+        # Stale-but-real persisted catalog -- still real data, use it as
+        # the source (not the hardcoded fallback), just flagged as stale.
+        pass
+    elif error or not sports:
         return SportsDiscovery(
             included=list(FOOTBALL_SPORT_KEYS),
             all_active_football=list(FOOTBALL_SPORT_KEYS),
@@ -310,7 +365,7 @@ def discover_football_sport_keys(api_key: Optional[str] = None) -> SportsDiscove
         included=included,
         all_active_football=[s["key"] for s in all_football],
         skipped=skipped,
-        discovery_error=None,
+        discovery_error=error,  # None on a live call, STALE_ODDS_MARKER-prefixed when persisted
         source="api",
     )
 
@@ -325,19 +380,23 @@ class MultiSportFetchResult:
     sports_failed: Dict[str, str] = field(default_factory=dict)
 
 
-def fetch_all_active_football_events(api_key: Optional[str] = None) -> MultiSportFetchResult:
+def fetch_all_active_football_events(
+    api_key: Optional[str] = None, persistent_cache: Optional[Any] = None,
+) -> MultiSportFetchResult:
     """Full production event-discovery entrypoint: discovers every
     currently active football competition from The Odds API (Step 1),
     fetches real odds for every one of them (Step 2), and merges
     everything into a single event pool (Step 6) -- never limited to a
     hardcoded set of major leagues."""
     api_key = api_key or _get_odds_api_key()
-    discovery = discover_football_sport_keys(api_key)
+    discovery = discover_football_sport_keys(api_key, persistent_cache)
 
     if not api_key:
         return MultiSportFetchResult(discovery=discovery, errors=["Не найден ODDS_API_KEY"])
 
-    events, credits, fetch_errors = fetch_football_events(api_key=api_key, sport_keys=discovery.included)
+    events, credits, fetch_errors = fetch_football_events(
+        api_key=api_key, sport_keys=discovery.included, persistent_cache=persistent_cache,
+    )
 
     succeeded_keys = {e.get("_sport_key") for e in events}
     sports_failed: Dict[str, str] = {}

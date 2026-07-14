@@ -90,7 +90,12 @@ class TrackingStorage:
                     statistics_cached INTEGER NOT NULL DEFAULT 0,
                     statistics_completeness REAL,
                     statistics_score REAL,
-                    final_combined_score REAL
+                    final_combined_score REAL,
+                    fixture_id INTEGER,
+                    matching_confidence REAL,
+                    sample_size_category TEXT,
+                    market_probability REAL,
+                    statistics_probability REAL
                 )
                 """
             )
@@ -153,6 +158,11 @@ class TrackingStorage:
             "statistics_completeness": "REAL",
             "statistics_score": "REAL",
             "final_combined_score": "REAL",
+            "fixture_id": "INTEGER",
+            "matching_confidence": "REAL",
+            "sample_size_category": "TEXT",
+            "market_probability": "REAL",
+            "statistics_probability": "REAL",
         }
         for column, coltype in needed.items():
             if column not in existing:
@@ -182,6 +192,8 @@ class TrackingStorage:
             "signal_level", "ranking_score", "outlier_warning", "rejection_reason",
             "statistics_source", "statistics_cached", "statistics_completeness",
             "statistics_score", "final_combined_score",
+            "fixture_id", "matching_confidence", "sample_size_category",
+            "market_probability", "statistics_probability",
         ]
         placeholders = ", ".join(f":{c}" for c in columns)
         sql = f"INSERT INTO predictions ({', '.join(columns)}) VALUES ({placeholders})"

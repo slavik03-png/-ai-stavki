@@ -21,11 +21,13 @@ from typing import Dict, List, Optional, Tuple
 
 from ai_predictions.football_cache import FootballCache
 from ai_predictions.football_matching import TeamMatch, best_team_match
+from ai_predictions.fixtures import Fixture
+from ai_predictions.probability_model import blend_probability, statistics_probability_for_side
 from ai_predictions.value_config import (
     API_FOOTBALL_FREE_PLAN_SEASONS,
     ENRICHMENT_SHORTLIST_SIZE,
 )
-from ai_predictions.value_engine import ValueCandidate, compute_combined_score
+from ai_predictions.value_engine import ValueCandidate, apply_probability_blend, compute_combined_score
 from ai_predictions.matching import AWAY, HOME
 from football.interface import Stat
 from football.providers.api_football import ApiFootballProvider, _season_for
@@ -252,6 +254,137 @@ def enrich_candidates(
             c.statistics_score = round(agreement, 3)
             c.final_combined_score = compute_combined_score(c)
         summary.per_event_source[f"{home_team} vs {away_team}"] = "api_football"
+
+    summary.api_football_requests_used = requests_used
+    summary.api_football_quota_remaining_today = cache.requests_available()
+    if owns_cache:
+        cache.close()
+    return summary
+
+
+def _form_win_rate_and_count(
+    provider: ApiFootballProvider, cache: FootballCache, team_name: str,
+) -> "tuple[Optional[float], int, int]":
+    """Real recent-form win rate (0..1) and real match count for `team_name`,
+    using the *exact* API-Football name already known from fixture
+    discovery (ai_predictions/fixtures.py) -- no fuzzy search step needed,
+    since the fixture itself already identified the real team. Returns
+    (win_rate_or_None, matches_counted, requests_spent). Cached by team
+    name (24h) so repeated candidates for the same match never re-spend
+    quota within a run or across restarts."""
+    cache_key = f"form_by_name:{team_name.strip().lower()}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached.get("win_rate"), cached.get("matches_counted", 0), 0
+
+    stat = provider.get_home_away_form(team_name)
+    if not stat.available:
+        # Structural "no data" (free-plan restriction, no finished
+        # matches) is worth caching; transient errors are not (handled by
+        # the provider's own per-run cache, see api_football.py).
+        cache.set(cache_key, {"win_rate": None, "matches_counted": 0})
+        return None, 0, 1
+
+    win_rate = _win_rate(stat.value.overall)
+    matches_counted = stat.value.matches_counted
+    cache.set(cache_key, {"win_rate": win_rate, "matches_counted": matches_counted})
+    return win_rate, matches_counted, 1
+
+
+@dataclass
+class FixtureEnrichmentSummary:
+    """Summary for the fixture-discovery-first pipeline's enrichment step
+    (Phase 5+6): every count here is real, never invented."""
+    attempted_events: int = 0
+    blended_events: int = 0  # both teams had usable real statistics
+    market_only_events: int = 0  # statistics unavailable for at least one side
+    api_football_requests_used: int = 0
+    api_football_quota_remaining_today: Optional[int] = None
+    skipped_reason: Optional[str] = None
+
+
+def enrich_matched_candidates(
+    candidates: List[ValueCandidate],
+    fixtures_by_event_id: Dict[str, Fixture],
+    *,
+    api_key: Optional[str],
+    cache: Optional[FootballCache] = None,
+    now: Optional[datetime.datetime] = None,
+) -> FixtureEnrichmentSummary:
+    """Fixture-discovery-first enrichment (Phase 5+6): every candidate here
+    already carries a confirmed real API-Football fixture match
+    (fixtures_by_event_id[candidate.event_id]), so team resolution is
+    exact -- only the real recent-form call itself is needed, saving the
+    fuzzy team-search step the older enrich_candidates() still needs.
+    Computes the auditable market+statistics probability blend
+    (ai_predictions/probability_model.py) and applies it in place via
+    value_engine.apply_probability_blend, which can move a candidate
+    between HIGH/MEDIUM/LOW/REJECTED. Never fabricates a win rate: a team
+    with zero real finished matches retrieved stays statistics_probability
+    = None and the candidate stays market-only."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    owns_cache = cache is None
+    cache = cache or FootballCache(now=now)
+    summary = FixtureEnrichmentSummary()
+
+    non_rejected = [c for c in candidates if c.event_id in fixtures_by_event_id]
+    shortlist = sorted(non_rejected, key=lambda c: c.ranking_score, reverse=True)[:ENRICHMENT_SHORTLIST_SIZE]
+
+    def _apply_market_only(c: ValueCandidate) -> None:
+        blend = blend_probability(c.consensus_probability, None, 0, 0)
+        apply_probability_blend(c, blend)
+
+    if not api_key:
+        for c in shortlist:
+            _apply_market_only(c)
+        summary.skipped_reason = "FOOTBALL_API_KEY не задан"
+        if owns_cache:
+            cache.close()
+        return summary
+
+    provider = ApiFootballProvider(api_key=api_key, now=now)
+
+    by_event: Dict[str, List[ValueCandidate]] = {}
+    for c in shortlist:
+        by_event.setdefault(c.event_id, []).append(c)
+
+    requests_used = 0
+    for event_id, event_candidates in by_event.items():
+        summary.attempted_events += 1
+        fixture = fixtures_by_event_id[event_id]
+
+        if not cache.can_spend(2):
+            for c in event_candidates:
+                c.fixture_id = fixture.fixture_id
+                c.fixture_match_confidence = getattr(fixture, "match_confidence", None)
+                _apply_market_only(c)
+            summary.market_only_events += 1
+            continue
+
+        home_rate, home_matches, spent_h = _form_win_rate_and_count(provider, cache, fixture.home_team)
+        cache.record_requests(spent_h)
+        requests_used += spent_h
+        away_rate, away_matches, spent_a = _form_win_rate_and_count(provider, cache, fixture.away_team)
+        cache.record_requests(spent_a)
+        requests_used += spent_a
+
+        for c in event_candidates:
+            c.fixture_id = fixture.fixture_id
+            if c.selection in (fixture.home_team, "{home}"):
+                stats_prob = statistics_probability_for_side(home_rate, away_rate, "home")
+            elif c.selection in (fixture.away_team, "{away}"):
+                stats_prob = statistics_probability_for_side(home_rate, away_rate, "away")
+            else:
+                # Draw/totals/double-chance markets -- this simple
+                # win-rate signal has no real opinion on them.
+                stats_prob = None
+            blend = blend_probability(c.consensus_probability, stats_prob, home_matches or 0, away_matches or 0)
+            apply_probability_blend(c, blend)
+
+        if any(v is not None for v in (home_rate, away_rate)):
+            summary.blended_events += 1
+        else:
+            summary.market_only_events += 1
 
     summary.api_football_requests_used = requests_used
     summary.api_football_quota_remaining_today = cache.requests_available()

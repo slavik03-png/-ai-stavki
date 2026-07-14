@@ -43,7 +43,9 @@ FAKE_SPORTS_CATALOG = [
 
 def _with_fake_sports_catalog(catalog, error=None):
     original = odds_client_mod.fetch_active_sports
-    odds_client_mod.fetch_active_sports = lambda api_key=None: (None, error) if error else (catalog, None)
+    odds_client_mod.fetch_active_sports = (
+        lambda api_key=None, persistent_cache=None: (None, error) if error else (catalog, None)
+    )
     return original
 
 
@@ -98,7 +100,7 @@ def test_events_from_multiple_sports_merge_into_one_pool():
     ]
     original_sports = _with_fake_sports_catalog(discovery_catalog)
 
-    def fake_fetch_football_events(api_key=None, sport_keys=None):
+    def fake_fetch_football_events(api_key=None, sport_keys=None, persistent_cache=None):
         events = []
         for key in sport_keys:
             e = _h2h_event(f"evt-{key}", key, hours_ahead=5)
@@ -130,7 +132,7 @@ def test_one_failed_sport_does_not_lose_the_others():
     ]
     original_sports = _with_fake_sports_catalog(discovery_catalog)
 
-    def fake_fetch_football_events(api_key=None, sport_keys=None):
+    def fake_fetch_football_events(api_key=None, sport_keys=None, persistent_cache=None):
         e = _h2h_event("evt-epl", "soccer_epl", hours_ahead=5)
         e["_sport_key"] = "soccer_epl"
         errors = ["The Odds API вернул HTTP 500 для soccer_norway_eliteserien"]

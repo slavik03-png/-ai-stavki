@@ -163,3 +163,71 @@ API_FOOTBALL_FREE_PLAN_SEASONS = frozenset({2022, 2023, 2024})
 #: first. Statistics only re-orders already-qualified candidates; it can
 #: never promote a REJECTED candidate or change a signal_level.
 STATS_BLEND_MAGNITUDE = 2.0
+
+# ---------------------------------------------------------------------------
+# API-Football-first fixture discovery (production version 2): the 36h
+# analysis window is discovered directly from API-Football fixtures (real
+# kickoff timestamps, real statuses), then matched against The Odds API's
+# bookmaker events -- rather than discovering the window from bookmaker
+# events alone. Every status code below is API-Football's own documented
+# short status code, not invented.
+# ---------------------------------------------------------------------------
+
+#: A fixture with this status has not started and is eligible if its real
+#: kickoff falls inside the analysis window.
+FIXTURE_NOT_STARTED_STATUSES = frozenset({"NS", "TBD"})
+
+#: A fixture currently being played -- excluded, it is not a future bet.
+FIXTURE_LIVE_STATUSES = frozenset({"1H", "HT", "2H", "ET", "BT", "P", "SUSP", "INT", "LIVE"})
+
+#: A fixture that has already concluded -- excluded.
+FIXTURE_FINISHED_STATUSES = frozenset({"FT", "AET", "PEN"})
+
+#: A fixture that will never be played as scheduled -- excluded.
+FIXTURE_CANCELLED_STATUSES = frozenset({"CANC", "ABD", "AWD", "WO"})
+
+#: Postponed with no confirmed new kickoff -- excluded unless the fixture's
+#: own real timestamp still happens to fall inside the window (handled by
+#: the same timestamp filter every other fixture goes through).
+FIXTURE_POSTPONED_STATUSES = frozenset({"PST"})
+
+#: How close two independently-reported kickoff times (API-Football vs The
+#: Odds API, for what should be the exact same real match) are allowed to
+#: be and still count as the same fixture -- covers real-world rounding/
+#: reporting differences between the two providers, never a guess about
+#: which match it "probably" is.
+FIXTURE_KICKOFF_TOLERANCE_MINUTES = 20
+
+#: Team-name similarity floor for matching an Odds API event to an
+#: API-Football fixture -- reuses the same floor already proven for
+#: API-Football team-name matching (see TEAM_MATCH_CONFIDENCE_FLOOR above).
+FIXTURE_MATCH_CONFIDENCE_FLOOR = TEAM_MATCH_CONFIDENCE_FLOOR
+
+# ---------------------------------------------------------------------------
+# Phase 6 -- auditable market+statistics probability blend. Every weight
+# below is exactly the suggested weighting from the spec; nothing here is
+# guessed. Sample-size categories are counted in real finished matches
+# retrieved for a team's recent form (FormSplit.matches_counted).
+# ---------------------------------------------------------------------------
+
+#: Minimum real recent matches (per team) required for each sample-size
+#: category. Below WEAK_MIN_MATCHES, statistics is not used at all (the
+#: candidate stays market-only).
+STRONG_SAMPLE_MIN_MATCHES = 8
+MEDIUM_SAMPLE_MIN_MATCHES = 4
+WEAK_SAMPLE_MIN_MATCHES = 1
+
+#: (market_weight, statistics_weight) per sample-size category -- always
+#: sums to 1.0.
+PROBABILITY_BLEND_WEIGHTS = {
+    "strong": (0.60, 0.40),
+    "medium": (0.75, 0.25),
+    "weak": (0.90, 0.10),
+    "none": (1.00, 0.00),
+}
+
+#: Final blended probability is never allowed outside this range -- avoids
+#: an extreme, overconfident number from a tiny/noisy sample while staying
+#: an honest, auditable estimate rather than a forced "attractive" figure.
+PROBABILITY_CLAMP_MIN = 0.02
+PROBABILITY_CLAMP_MAX = 0.98

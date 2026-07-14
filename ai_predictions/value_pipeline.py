@@ -1,24 +1,26 @@
 """
-End-to-end orchestration for the ranked HIGH/MEDIUM/LOW/REJECTED
-cross-bookmaker value-detection strategy:
+End-to-end orchestration for the fixture-discovery-first, ranked
+HIGH/MEDIUM/LOW/REJECTED cross-bookmaker value-detection strategy:
 
-  discover every active football competition from The Odds API (not a
-  hardcoded major-league list) -> fetch real odds for all of them -> 36h
-  window filter -> extract/validate/dedupe/group real bookmaker rows
-  (ai_predictions/matching.py) -> build real ValueCandidates with a
-  signal_level + ranking_score from cross-bookmaker price divergence
-  (ai_predictions/value_engine.py) -> rank ALL candidates globally
-  (HIGH -> MEDIUM -> LOW) and keep up to 5 total, one signal per event
-  with limited exceptions (ai_predictions/value_selector.py) -> persist
-  EVERY evaluated candidate (including REJECTED ones) to tracking,
-  dedup-safe -> render the Russian report text with full pipeline and
-  event-discovery diagnostics.
-
-Deliberately does not call football/ or ApiFootballProvider at all: this
-strategy needs no team statistics. The API-Football integration
-(football/providers/api_football.py) is left completely untouched and
-available for ai_predictions/pipeline.py (the statistics-based strategy)
-once a paid plan makes current-season data available.
+  discover every real fixture kicking off in the strict 36h window
+  (Asia/Yekaterinburg, [now, now+36h)) from API-Football
+  (ai_predictions/fixtures.py) -> scope The Odds API querying to only the
+  sport_keys plausibly matching those fixtures' leagues/countries
+  (ai_predictions/league_relevance.py) -> fetch real odds for that scoped
+  set, quota-safely 24h-cached (ai_predictions/odds_client.py) -> confident
+  fixture<->event matching, ambiguous pairs dropped
+  (ai_predictions/fixture_matching.py) -> extract/validate/dedupe/group real
+  bookmaker rows for matched events only (ai_predictions/matching.py) ->
+  build real ValueCandidates with a signal_level + ranking_score from
+  cross-bookmaker price divergence (ai_predictions/value_engine.py) ->
+  fixture-aware statistics enrichment + auditable market+statistics
+  probability blend, which can move a candidate between tiers
+  (ai_predictions/enrichment.py, ai_predictions/probability_model.py) ->
+  rank ALL candidates globally (HIGH -> MEDIUM -> LOW) and keep up to 5
+  total, filling down tiers rather than ever showing REJECTED
+  (ai_predictions/value_selector.py) -> persist EVERY evaluated candidate
+  (including REJECTED ones) to tracking, dedup-safe -> render the Russian
+  report text with full pipeline and fixture-discovery diagnostics.
 """
 
 from __future__ import annotations
@@ -28,8 +30,11 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from ai_predictions.enrichment import EnrichmentSummary, enrich_candidates
+from ai_predictions.enrichment import FixtureEnrichmentSummary, enrich_matched_candidates
+from ai_predictions.fixture_matching import FixtureMatchResult, match_fixtures_to_events
+from ai_predictions.fixtures import Fixture, FixtureDiscoveryResult, discover_fixtures_in_window
 from ai_predictions.football_cache import FootballCache
+from ai_predictions.league_relevance import select_relevant_sport_keys
 from ai_predictions.matching import (
     MarketGroup,
     ValidationStats,
@@ -39,7 +44,13 @@ from ai_predictions.matching import (
     raw_bookmaker_row_counts,
     validate_rows,
 )
-from ai_predictions.odds_client import fetch_all_active_football_events
+from ai_predictions.odds_client import (
+    QUOTA_EXHAUSTED_MARKER,
+    STALE_ODDS_MARKER,
+    discover_football_sport_keys,
+    fetch_active_sports,
+    fetch_football_events,
+)
 from ai_predictions.value_config import (
     LOW_MIN_BOOKMAKERS,
     MODEL_VERSION,
@@ -60,6 +71,8 @@ from ai_predictions.value_selector import ValueSelectionResult, select_value_rec
 from ai_predictions.window import filter_events_in_window
 from tracking.models import STATUS_PENDING, Prediction
 from tracking.storage import DuplicatePredictionError, TrackingStorage
+
+ODDS_CACHE_DB_PATH = os.path.join("data", "odds_api_cache.db")
 
 MARKET_TYPE_DISPLAY_NAMES = {
     "1x2": "Исход матча (1X2)",
@@ -122,10 +135,12 @@ class ValuePipelineResult:
     sports_discovered: List[str] = field(default_factory=list)
     sports_queried: List[str] = field(default_factory=list)
     sports_skipped: Dict[str, str] = field(default_factory=dict)
-    #: API-Football enrichment summary for this run (see
-    #: ai_predictions.enrichment.EnrichmentSummary) -- always present, even
-    #: when enrichment made zero real requests.
-    enrichment_summary: Optional[EnrichmentSummary] = None
+    #: Fixture-aware enrichment summary for this run (see
+    #: ai_predictions.enrichment.FixtureEnrichmentSummary) -- always
+    #: present, even when enrichment made zero real requests.
+    enrichment_summary: Optional[FixtureEnrichmentSummary] = None
+    fixture_discovery: Optional[FixtureDiscoveryResult] = None
+    fixture_match_result: Optional[FixtureMatchResult] = None
 
 
 def _event_id(event: Dict[str, Any]) -> str:
@@ -135,6 +150,8 @@ def _event_id(event: Dict[str, Any]) -> str:
 def _candidate_to_prediction(candidate: ValueCandidate) -> Prediction:
     outlier_flag = candidate.outlier_warning is not None
     rejection_text = "; ".join(candidate.rejection_reasons) if candidate.rejection_reasons else None
+    model_probability = candidate.estimated_probability if candidate.estimated_probability is not None else candidate.consensus_probability
+    edge = candidate.edge_final if candidate.edge_final is not None else candidate.edge
     return Prediction(
         sport=candidate.sport,
         country=candidate.country,
@@ -147,16 +164,16 @@ def _candidate_to_prediction(candidate: ValueCandidate) -> Prediction:
         market_name=MARKET_TYPE_DISPLAY_NAMES.get(candidate.market_type, candidate.market_type),
         selection=candidate.selection,
         bookmaker_odds=candidate.best_price,
-        model_probability=candidate.consensus_probability,
-        confidence_score=round(max(0.0, min(100.0, candidate.edge * 100.0)), 1),
+        model_probability=model_probability,
+        confidence_score=round(max(0.0, min(100.0, edge * 100.0)), 1),
         confidence_level=_confidence_level(candidate.unique_bookmaker_count),
         recommendation_group=_LEVEL_TO_RECOMMENDATION_GROUP.get(candidate.signal_level, "avoid"),
         explanation=(
             f"Лучшая цена {candidate.best_price:.2f} у {candidate.best_bookmaker} против справедливой "
             f"{candidate.fair_price:.2f} по {candidate.consensus_bookmaker_count} другим букмекерам "
-            f"(расхождение {candidate.edge:.3f}, всего {candidate.unique_bookmaker_count} букмекеров по исходу)."
+            f"(расхождение {edge:.3f}, всего {candidate.unique_bookmaker_count} букмекеров по исходу)."
         ),
-        data_provider="the_odds_api",
+        data_provider="the_odds_api+api_football" if candidate.fixture_id else "the_odds_api",
         model_version=MODEL_VERSION,
         line=candidate.line,
         status=STATUS_PENDING,
@@ -169,6 +186,11 @@ def _candidate_to_prediction(candidate: ValueCandidate) -> Prediction:
         statistics_completeness=candidate.statistics_completeness,
         statistics_score=candidate.statistics_score,
         final_combined_score=candidate.final_combined_score,
+        fixture_id=candidate.fixture_id,
+        matching_confidence=candidate.fixture_match_confidence,
+        sample_size_category=candidate.sample_size_category,
+        market_probability=candidate.market_probability,
+        statistics_probability=candidate.statistics_probability,
     )
 
 
@@ -206,37 +228,100 @@ def _debug_group_lines(groups: Dict[Any, MarketGroup], limit: int = 10) -> List[
     return lines[:limit]
 
 
+_UNSET = object()
+
+
 def run_value_predictions(
     *,
     odds_api_key: Optional[str] = None,
+    football_api_key: Any = _UNSET,
     storage: Optional[TrackingStorage] = None,
     now: Optional[datetime.datetime] = None,
     max_events: Optional[int] = None,
 ) -> ValuePipelineResult:
-    """Runs the full cross-bookmaker value-detection pipeline once. Never
-    raises for expected failure modes (no odds, no qualifying divergence)
-    -- those show up as an honest "no recommendations today" report, with
-    full diagnostics distinguishing "off-season / no events in window"
-    from "events present but nothing matched"."""
+    """Runs the full fixture-discovery-first value-detection pipeline once.
+    Never raises for expected failure modes (no fixtures, no odds, no
+    match, no qualifying divergence) -- those show up as an honest "no
+    recommendations today" report, with full diagnostics distinguishing
+    each condition from the others."""
     now = now or datetime.datetime.now(datetime.timezone.utc)
     owns_storage = storage is None
     storage = storage or TrackingStorage()
+    odds_api_key = odds_api_key or os.getenv("ODDS_API_KEY")
+    if football_api_key is _UNSET:
+        football_api_key = os.getenv("FOOTBALL_API_KEY")
 
-    fetch_result = fetch_all_active_football_events(api_key=odds_api_key)
-    events = fetch_result.events
-    credits_remaining = fetch_result.credits_remaining
-    odds_errors = list(fetch_result.errors)
-    discovery = fetch_result.discovery
-    sports_skipped: Dict[str, str] = dict(discovery.skipped)
-    sports_skipped.update(fetch_result.sports_failed)
+    football_cache = FootballCache(now=now)
+    odds_cache = FootballCache(db_path=ODDS_CACHE_DB_PATH, now=now)
+
+    # -- Phase 1: real fixture discovery (API-Football, primary source of
+    #    truth for "what matches actually exist in the window"). --
+    fixture_discovery = discover_fixtures_in_window(football_api_key, football_cache, now)
+    fixtures = fixture_discovery.fixtures
+
+    odds_errors: List[str] = list(fixture_discovery.errors)
+    sports_skipped: Dict[str, str] = {}
+    events: List[Dict[str, Any]] = []
+    credits_remaining = None
+    discovery_source = "api"
+    discovery_error = None
+    quota_exhausted = False
+    stale_odds = False
+    scoped_sport_keys: List[str] = []
+    all_active_football: List[str] = []
+
+    if not odds_api_key:
+        odds_errors.append("Не найден ODDS_API_KEY")
+    elif not fixtures:
+        # Nothing to scope The Odds API querying to -- querying it blindly
+        # would burn quota for events we could never confidently match to
+        # a real fixture anyway.
+        pass
+    else:
+        catalog, catalog_error = fetch_active_sports(odds_api_key, odds_cache)
+        if catalog_error and STALE_ODDS_MARKER in catalog_error:
+            stale_odds = True
+        if catalog_error and QUOTA_EXHAUSTED_MARKER in catalog_error and not catalog:
+            quota_exhausted = True
+        catalog = catalog or []
+        football_catalog = [c for c in catalog if c.get("group") == "Soccer"]
+        all_active_football = [c["key"] for c in football_catalog if c.get("key")]
+        scoped_sport_keys = select_relevant_sport_keys(fixtures, football_catalog)
+
+        if scoped_sport_keys:
+            odds_events, credits_remaining, fetch_errors = fetch_football_events(
+                api_key=odds_api_key, sport_keys=scoped_sport_keys, persistent_cache=odds_cache,
+            )
+            events = odds_events
+            odds_errors.extend(fetch_errors)
+            for err in fetch_errors:
+                if QUOTA_EXHAUSTED_MARKER in err:
+                    quota_exhausted = True
+                if STALE_ODDS_MARKER in err:
+                    stale_odds = True
+        else:
+            odds_errors.append(
+                "Ни один вид спорта The Odds API не сопоставлен с обнаруженными турнирами/странами фикстур"
+            )
 
     in_window, excluded = filter_events_in_window(events, now)
     if max_events is not None:
         in_window = in_window[:max_events]
 
+    # -- Phase 4: confident fixture<->event matching; ambiguous pairs are
+    #    dropped rather than guessed. --
+    match_result = match_fixtures_to_events(fixtures, in_window)
+    matched_events = [m.event for m in match_result.matches]
+    fixtures_by_event_id: Dict[str, Fixture] = {}
+    match_confidence_by_event_id: Dict[str, float] = {}
+    for m in match_result.matches:
+        event_id = _event_id(m.event)
+        fixtures_by_event_id[event_id] = m.fixture
+        match_confidence_by_event_id[event_id] = m.confidence
+
     stats = ValidationStats()
     all_rows = []
-    for event in in_window:
+    for event in matched_events:
         event_id = _event_id(event)
         league = event.get("sport_title") or event.get("_sport_key")
         try:
@@ -263,27 +348,26 @@ def run_value_predictions(
             markets_matched += 1
 
     all_candidates = build_value_candidates_from_groups(groups, raw_counts)
+    for c in all_candidates:
+        conf = match_confidence_by_event_id.get(c.event_id)
+        if conf is not None:
+            c.fixture_match_confidence = conf
 
-    # API-Football statistics enrichment: takes the top preliminary
-    # candidates (pure odds-only ranking_score) and, best-effort, attaches
-    # a real recent-form statistics signal that only re-ranks WITHIN an
-    # already-decided HIGH/MEDIUM/LOW tier (see value_engine.compute_
-    # combined_score) -- never changes signal_level, never invents a
-    # market, never raises. select_value_recommendations below then uses
-    # the (possibly stats-nudged) score for its own within-tier ordering.
-    enrichment_summary = enrich_candidates(
+    # Phase 5+6: fixture-aware statistics enrichment + auditable
+    # market+statistics probability blend -- can move a candidate between
+    # HIGH/MEDIUM/LOW/REJECTED (see value_engine.apply_probability_blend),
+    # unlike the older odds-only compute_combined_score nudge.
+    enrichment_summary = enrich_matched_candidates(
         all_candidates,
-        api_key=os.getenv("FOOTBALL_API_KEY"),
-        cache=FootballCache(now=now),
+        fixtures_by_event_id,
+        api_key=football_api_key,
+        cache=football_cache,
         now=now,
     )
 
     result = select_value_recommendations(all_candidates)
 
     outlier_warning_count = sum(1 for c in all_candidates if c.outlier_warning)
-    # Real total counts per level across EVERY evaluated candidate this
-    # run (Step 12) -- deliberately independent of how many made it into
-    # the displayed top_signals list, which is capped at MAX_TOTAL_SIGNALS.
     high_total = sum(1 for c in all_candidates if c.signal_level == SIGNAL_HIGH)
     medium_total = sum(1 for c in all_candidates if c.signal_level == SIGNAL_MEDIUM)
     low_total = sum(1 for c in all_candidates if c.signal_level == SIGNAL_LOW)
@@ -313,18 +397,27 @@ def run_value_predictions(
         rejected_count=rejected_total,
         outlier_warning_count=outlier_warning_count,
         remaining_odds_api_credits=credits_remaining,
-        sports_discovered=discovery.all_active_football,
-        sports_queried=fetch_result.sports_queried,
+        sports_discovered=all_active_football,
+        sports_queried=scoped_sport_keys,
         sports_skipped=sports_skipped,
-        discovery_source=discovery.source,
-        discovery_error=discovery.discovery_error,
+        discovery_source=discovery_source,
+        discovery_error=discovery_error,
         api_football_attempted_events=enrichment_summary.attempted_events,
-        api_football_matched_events=enrichment_summary.matched_events,
-        api_football_unmatched_events=enrichment_summary.unmatched_events,
+        api_football_matched_events=enrichment_summary.blended_events,
+        api_football_unmatched_events=enrichment_summary.market_only_events,
         api_football_requests_used=enrichment_summary.api_football_requests_used,
         api_football_quota_remaining_today=enrichment_summary.api_football_quota_remaining_today,
-        api_football_season_allowed=enrichment_summary.season_allowed,
+        api_football_season_allowed=True,
         api_football_skipped_reason=enrichment_summary.skipped_reason,
+        fixtures_discovered=len(fixtures),
+        fixtures_excluded_by_window=fixture_discovery.excluded_by_window,
+        fixtures_excluded_by_status=fixture_discovery.excluded_by_status,
+        fixtures_matched_to_odds=len(match_result.matches),
+        fixtures_unmatched=len(match_result.unmatched_fixtures),
+        fixtures_ambiguous=len(match_result.ambiguous_fixtures),
+        odds_events_unmatched=len(match_result.unmatched_events),
+        odds_quota_exhausted=quota_exhausted,
+        odds_stale_fallback=stale_odds,
     )
 
     debug_groups: List[str] = []
@@ -333,19 +426,14 @@ def run_value_predictions(
 
     report_text = render_value_report(result, diagnostics)
     telegram_messages = render_telegram_signals_message(result, diagnostics)
-    # Only real fetch failures count as "API errors" here -- normal
-    # discovery skips (inactive competition, outrights-only market) are
-    # expected filtering, not an error, and must never be aggregated as
-    # one. odds_errors already carries exactly one entry per genuinely
-    # failed competition (see fetch_football_events), so sports_failed
-    # (a same-source lookup keyed by sport, used only for sports_queried)
-    # is deliberately NOT also passed here to avoid double-counting.
     api_error_summary = summarize_api_errors_ru(odds_errors, {})
 
     saved, duplicates = _save_all_candidates(all_candidates, storage)
 
     if owns_storage:
         storage.close()
+    football_cache.close()
+    odds_cache.close()
 
     return ValuePipelineResult(
         report_text=report_text,
@@ -365,8 +453,10 @@ def run_value_predictions(
         high_count=high_total,
         medium_count=medium_total,
         low_count=low_total,
-        sports_discovered=discovery.all_active_football,
-        sports_queried=fetch_result.sports_queried,
+        sports_discovered=all_active_football,
+        sports_queried=scoped_sport_keys,
         sports_skipped=sports_skipped,
         enrichment_summary=enrichment_summary,
+        fixture_discovery=fixture_discovery,
+        fixture_match_result=match_result,
     )

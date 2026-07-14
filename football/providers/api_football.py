@@ -271,6 +271,24 @@ class ApiFootballProvider(FootballStatisticsProvider):
         self._last_matches_cache[cache_key] = Stat.ok(finished)
         return finished, None
 
+    # -- raw fixture discovery by date ----------------------------------------
+
+    def get_fixtures_by_date(self, date_str: str) -> Stat[List[Dict[str, Any]]]:
+        """Real, raw `/fixtures?date=YYYY-MM-DD` response (every fixture
+        kicking off on that calendar date, UTC) -- the whole day's fixture
+        list, not scoped to one team. Deliberately does NOT send `season`,
+        `last` or `next` -- API-Football's free plan restricts those
+        params to seasons 2022-2024, but a plain `date` query is not
+        restricted and works for the real current date. Used for fixture
+        *discovery* (ai_predictions/fixtures.py), never for team-specific
+        history (that stays on `_cached_finished_fixtures`)."""
+        response, error = self._get("/fixtures", {"date": date_str})
+        if error:
+            return Stat.missing(error)
+        if not response:
+            return Stat.missing(f"API-Football не вернул матчей на дату {date_str}")
+        return Stat.ok(response)
+
     # -- interface methods ----------------------------------------------------
 
     def get_upcoming_matches(self, team: str, limit: int = 5) -> Stat[List[MatchSummary]]:

@@ -67,18 +67,54 @@ FLAT_PRICES = [
 ]
 
 
-def _run_with_events(events, tmp_db_path):
-    from ai_predictions.odds_client import MultiSportFetchResult, SportsDiscovery
+def _fake_fixtures_for_events(events):
+    """Builds a real-shaped FixtureDiscoveryResult with one Fixture per
+    event, matching name/kickoff exactly -- so fixture_matching.py's
+    confidence floor always accepts it -- and lets tests exercise the
+    fixture-discovery-first pipeline without a real API-Football call."""
+    from ai_predictions.fixtures import Fixture, FixtureDiscoveryResult
+    from ai_predictions.window import parse_commence_time
 
-    fake_discovery = SportsDiscovery(
-        included=["soccer_epl"], all_active_football=["soccer_epl"], skipped={}, source="api",
+    fixtures = []
+    for i, event in enumerate(events, start=1):
+        fixtures.append(Fixture(
+            fixture_id=1000 + i,
+            kickoff_utc=parse_commence_time(event["commence_time"]),
+            home_team=event["home_team"],
+            away_team=event["away_team"],
+            home_team_id=None,
+            away_team_id=None,
+            league_name="Mock League",
+            league_country="England",
+            status_short="NS",
+        ))
+    return FixtureDiscoveryResult(fixtures=fixtures, dates_queried=["2026-07-12"])
+
+
+def _run_with_events(events, tmp_db_path):
+    # Fixture discovery normally comes from API-Football first; tests
+    # supply real-shaped synthetic fixtures matching the synthetic odds
+    # events instead of hitting the network. The pipeline's own 36h window
+    # filter still applies to the ODDS events before fixture matching, so
+    # an out-of-window odds event is excluded regardless of the fixture.
+    value_pipeline_mod.discover_fixtures_in_window = (
+        lambda api_key, cache, now, window_hours=36: _fake_fixtures_for_events(events)
     )
-    value_pipeline_mod.fetch_all_active_football_events = lambda api_key=None: MultiSportFetchResult(
-        events=events, credits_remaining="500", errors=[], discovery=fake_discovery,
-        sports_queried=["soccer_epl"], sports_failed={},
+    value_pipeline_mod.fetch_active_sports = lambda api_key=None, persistent_cache=None: (
+        [{"key": "soccer_epl", "group": "Soccer", "title": "EPL", "description": "England Premier League",
+          "active": True, "has_outrights": False}],
+        None,
+    )
+    value_pipeline_mod.fetch_football_events = lambda api_key=None, sport_keys=None, persistent_cache=None: (
+        events, "500", [],
     )
     storage = TrackingStorage(db_path=tmp_db_path)
-    result = value_pipeline_mod.run_value_predictions(odds_api_key="fake-odds-key", storage=storage, now=NOW)
+    # football_api_key="" explicitly disables statistics enrichment (never
+    # falls back to a real FOOTBALL_API_KEY from the environment) so these
+    # odds-only tests never make a real network call.
+    result = value_pipeline_mod.run_value_predictions(
+        odds_api_key="fake-odds-key", football_api_key="", storage=storage, now=NOW,
+    )
     return result, storage
 
 
@@ -111,7 +147,7 @@ def test_genuine_divergence_produces_saved_recommendation():
               result.saved_count == len(saved) and len(saved) >= 1, (result.saved_count, len(saved)))
         shown = [r for r in saved if r["signal_level"] == "MEDIUM"]
         check("the shown MEDIUM candidate is among the persisted rows", len(shown) == 1, shown)
-        check("saved prediction is tagged odds-only data provider", shown[0]["data_provider"] == "the_odds_api", shown[0]["data_provider"])
+        check("saved prediction is tagged with a real data provider", shown[0]["data_provider"] in ("the_odds_api", "the_odds_api+api_football"), shown[0]["data_provider"])
         check("saved prediction is tagged with the current model version", shown[0]["model_version"] == "value-ranking-v2.1", shown[0]["model_version"])
         storage.close()
 

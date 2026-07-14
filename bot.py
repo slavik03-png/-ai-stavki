@@ -12,11 +12,12 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 # Only the orchestration package is imported here -- never tracking/ or
 # selection_engine/ directly (see tests/test_selection_isolation.py and
 # tests/test_tracking_bot_isolation.py, which assert this boundary).
-# The bot currently uses the cross-bookmaker value-detection strategy
-# (ai_predictions/value_pipeline.py), which only needs real odds -- no
-# football statistics provider. ai_predictions/pipeline.py (statistics +
-# odds) stays available for when a paid API-Football plan unlocks
-# current-season data.
+# The bot uses the fixture-discovery-first value-detection strategy
+# (ai_predictions/value_pipeline.py): real fixtures come from API-Football
+# first, The Odds API is queried only for what those fixtures need, and
+# statistics enrichment blends into the market probability when real form
+# data is available. ai_predictions/pipeline.py (the older statistics-only
+# strategy) stays available separately.
 from ai_predictions.value_pipeline import run_value_predictions
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -237,9 +238,13 @@ async def _send_cached_predictions(query) -> None:
 async def handle_ai_predictions(query) -> None:
     global ai_predictions_cache, ai_predictions_last_diagnostics
 
-    if not ODDS_API_KEY:
+    if not ODDS_API_KEY or not FOOTBALL_API_KEY:
+        missing = ", ".join(
+            name for name, present in (("ODDS_API_KEY", ODDS_API_KEY), ("FOOTBALL_API_KEY", FOOTBALL_API_KEY))
+            if not present
+        )
         await query.message.reply_text(
-            "❌ Для прогнозов ИИ нужен ключ ODDS_API_KEY.",
+            f"❌ Для прогнозов ИИ нужны ключи: {missing}.",
             reply_markup=main_keyboard(),
         )
         return

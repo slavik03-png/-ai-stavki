@@ -5,6 +5,6 @@
 - [Value-divergence strategy design](value-divergence-strategy.md) — leave-one-out consensus avoids self-referential zero-edge; spreads excluded (no settlement support).
 - [Window-exclusion diagnostics & Odds API market fallback](window-exclusion-diagnostics.md) — 0-matched events often means "all events outside the time window", not broken matching; parse 422 market-rejection lists instead of collapsing to a minimal fallback.
 - [Dynamic football-league discovery](dynamic-football-discovery.md) — use The Odds API's /v4/sports catalog (group=Soccer, active, non-outrights) instead of a hardcoded league list; cache successes only, never errors.
-- [Value-divergence strategy design](value-divergence-strategy.md) now also covers the current global top-5 (HIGH→MEDIUM→LOW) selection policy that supersedes the earlier per-level cap-of-5.
+- [Value-divergence strategy design](value-divergence-strategy.md) covers global top-5 selection AND the fixture-discovery-first pipeline (API-Football fixtures drive everything; Odds API is scoped/matched to them, never the other way round).
 - [Telegram output: concise vs diagnostics split](telegram-concise-vs-diagnostics.md) — user-facing signal message and technical diagnostics are two separate render functions; never merge them back into one.
 - [Display selection vs canonical settlement token](display-vs-canonical-selection.md) — ValueCandidate.selection is a display string, but settlement matches canonical tokens; translate only in rendering, never mutate the stored field.
