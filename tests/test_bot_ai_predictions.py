@@ -186,6 +186,27 @@ async def main():
 
     bot.run_football_predictions = original_run
 
+    # -- verification-after-save: if the archive write doesn't actually
+    # land in SQLite, the run must be treated as unsuccessful (error
+    # reply, no cache, no success timestamp bump) -------------------------
+    bot._open_football_cache = fresh_cache_factory()
+    bot.ai_predictions_cache = None
+    ts_before = bot.ai_predictions_last_success_ts
+    original_save = bot.save_daily_archive
+    bot.save_daily_archive = lambda *a, **kw: None  # simulate a write that never lands
+    bot.run_football_predictions = lambda *a, **kw: fake_result(messages=["🤖 Никогда не должно дойти"])
+    update, query = make_callback_update(bot.AI_PREDICTIONS_PREFIX)
+    await bot.handle_callback(update, ctx)
+    unsuccessful_reply_text = "\n".join(str(c) for c in query.message.reply_text.call_args_list)
+    check("unconfirmed archive write is reported as an error, not a success",
+          "Ошибка" in unsuccessful_reply_text and "Никогда не должно дойти" not in unsuccessful_reply_text,
+          unsuccessful_reply_text)
+    check("ai_predictions_cache is not populated on unconfirmed write", bot.ai_predictions_cache is None)
+    check("last success timestamp is not bumped on unconfirmed write", bot.ai_predictions_last_success_ts == ts_before)
+    bot.save_daily_archive = original_save
+
+    bot.run_football_predictions = original_run
+
     failed = [r for r in results if r[1] == "FAIL"]
     print(f"\n==SUMMARY== {len(results) - len(failed)}/{len(results)} passed")
     if failed:

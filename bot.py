@@ -373,7 +373,23 @@ async def handle_ai_predictions(query, *, force_refresh: bool = False) -> None:
                 )
                 messages = result.telegram_messages or ["На ближайшие 36 часов подходящих сигналов не найдено."]
                 save_daily_archive(football_cache, result, now_dt)
-                archive = DailyArchive(messages=messages, diagnostics={}, generated_at=now_dt)
+
+                # Requirement: never report success unless the archive is
+                # confirmed to actually be on disk in SQLite. Verify via a
+                # SEPARATE connection to the same db file (not the one that
+                # just wrote it) so this is a real read-back, not just a
+                # same-connection cache hit.
+                verify_cache = FootballCache(db_path=football_cache.db_path, now=now_dt)
+                try:
+                    verified_archive = load_daily_archive(verify_cache, now_dt, ignore_ttl=True)
+                finally:
+                    verify_cache.close()
+                if verified_archive is None:
+                    raise RuntimeError(
+                        "Суточный архив не подтверждён в SQLite после записи -- запись не выполнена."
+                    )
+                archive = verified_archive
+
                 ai_predictions_cache = {"archive": archive}
                 # Full technical diagnostics are kept only for /status --
                 # never sent here.
