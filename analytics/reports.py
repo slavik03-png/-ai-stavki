@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 
 from analytics.config import DEFAULT_STAKE
 from analytics.storage import AnalyticsStorage
+from ai_predictions.window import format_user_time
 
 
 def _fmt_pct(value: float) -> str:
@@ -68,7 +69,7 @@ def compact_report(storage: AnalyticsStorage, *, stake: float = DEFAULT_STAKE, n
         lines.append(f"Лучший рынок: {best_market['key']} (ROI {_fmt_pct(best_market['roi'])})")
     if best_league:
         lines.append(f"Лучшая лига: {best_league['key']} (ROI {_fmt_pct(best_league['roi'])})")
-    lines.append(f"Обновлено: {now.strftime('%Y-%m-%d %H:%M UTC')}")
+    lines.append(f"Обновлено: {format_user_time(now)}")
     return "\n".join(lines)
 
 
@@ -132,5 +133,5 @@ def admin_report(storage: AnalyticsStorage, *, stake: float = DEFAULT_STAKE, now
         lines.append(f"  {g['key']}: {g['settled_predictions']} расч., ROI {_fmt_pct(g['roi'])}, побед {_fmt_pct(g['win_rate'])}")
 
     lines.append("")
-    lines.append(f"Обновлено: {now.strftime('%Y-%m-%d %H:%M UTC')}")
+    lines.append(f"Обновлено: {format_user_time(now)}")
     return "\n".join(lines)

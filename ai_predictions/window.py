@@ -77,3 +77,18 @@ def format_card_time(dt: datetime.datetime) -> str:
     format_display_time() above, which existing diagnostics/tests rely on."""
     local = to_display_timezone(dt)
     return local.strftime("%d.%m.%Y в %H:%M")
+
+
+def format_user_time(dt: datetime.datetime, now: Optional[datetime.datetime] = None) -> str:
+    """The one timestamp formatter for anything a user reads (reports,
+    status, "updated at" lines): always Yekaterinburg local time, never
+    UTC. Falls back to a friendlier "сегодня в ЧЧ:ММ" when `dt` falls on
+    the same Yekaterinburg calendar date as `now` (defaults to the
+    current moment); otherwise "ДД.ММ.ГГГГ ЧЧ:ММ". UTC must stay confined
+    to logs/diagnostics -- never pass a UTC-labelled string to the user."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    local = to_display_timezone(dt)
+    local_now = to_display_timezone(now)
+    if local.date() == local_now.date():
+        return "сегодня в " + local.strftime("%H:%M")
+    return local.strftime("%d.%m.%Y %H:%M")

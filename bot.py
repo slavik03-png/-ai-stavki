@@ -33,7 +33,7 @@ from ai_predictions.football_pipeline import (
     save_daily_archive,
 )
 from ai_predictions.value_config import DAILY_ARCHIVE_TTL_HOURS
-from ai_predictions.window import format_card_time
+from ai_predictions.window import format_user_time
 
 # The AI Betting Analytics module (analytics/) is a new, independent
 # top-level package -- like ai_predictions/, it is fine for bot.py to
@@ -389,7 +389,7 @@ async def send_cached(query, prefix: str) -> None:
 
 def _format_archive_header(generated_at: datetime, *, stale: bool = False) -> str:
     label = "Данные из суточного архива" if not stale else "Архив ещё обновляется, показаны последние сохранённые данные"
-    when = format_card_time(generated_at)
+    when = format_user_time(generated_at)
     return f"💾 {label}\nОбновлено: {when}"
 
 
@@ -559,7 +559,7 @@ def build_status_text() -> str:
 
     if archive is not None:
         archive_age_text = _format_ago(now_dt, archive.generated_at)
-        last_update_text = archive.generated_at.strftime("%d.%m.%Y %H:%M") + " UTC"
+        last_update_text = format_user_time(archive.generated_at, now_dt)
         is_fresh = (now_dt - archive.generated_at) <= timedelta(hours=DAILY_ARCHIVE_TTL_HOURS)
         archive_state_text = "актуален" if is_fresh else "устарел (>24ч), будет обновлён при следующем запросе"
         d = archive.diagnostics
