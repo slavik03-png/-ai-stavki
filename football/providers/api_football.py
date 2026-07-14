@@ -90,6 +90,7 @@ class ApiFootballProvider(FootballStatisticsProvider):
         self._fixture_stats_cache: Dict[int, Optional[Dict[str, Any]]] = {}
         self._standings_cache: Dict[str, Stat] = {}
         self._injuries_cache: Dict[str, Stat] = {}
+        self._predictions_cache: Dict[int, Stat] = {}
 
     # -- low-level HTTP -----------------------------------------------------
 
@@ -288,6 +289,43 @@ class ApiFootballProvider(FootballStatisticsProvider):
         if not response:
             return Stat.missing(f"API-Football не вернул матчей на дату {date_str}")
         return Stat.ok(response)
+
+    def get_predictions(self, fixture_id: int) -> Stat[Dict[str, Any]]:
+        """Real, raw `/predictions?fixture=` response for one fixture --
+        API-Football's own win/draw/win percent model, advice text and
+        goals-performance hints. Never invented: a missing/malformed
+        `predictions` block is Stat.missing, and callers must not assume
+        every sub-field (percent/advice/under_over) is present even when
+        this call succeeds -- API-Football sometimes returns some of
+        them as null for lower-tier competitions."""
+        if fixture_id in self._predictions_cache:
+            return self._predictions_cache[fixture_id]
+        response, error = self._get("/predictions", {"fixture": fixture_id})
+        if error:
+            # Transient (rate limit / network / budget) errors are not
+            # cached -- a retry within this run may still succeed.
+            return Stat.missing(error)
+        if not response:
+            result = Stat.missing(f"API-Football не вернул прогноз для матча {fixture_id}")
+            self._predictions_cache[fixture_id] = result
+            return result
+        entry = response[0]
+        predictions = entry.get("predictions") or {}
+        if not predictions:
+            result = Stat.missing(f"API-Football вернул пустой прогноз для матча {fixture_id}")
+            self._predictions_cache[fixture_id] = result
+            return result
+        result = Stat.ok({
+            "percent": predictions.get("percent") or {},
+            "advice": predictions.get("advice"),
+            "under_over": predictions.get("under_over"),
+            "goals": predictions.get("goals") or {},
+            "win_or_draw": predictions.get("win_or_draw"),
+            "winner_comment": (predictions.get("winner") or {}).get("comment"),
+            "comparison": entry.get("comparison") or {},
+        })
+        self._predictions_cache[fixture_id] = result
+        return result
 
     # -- interface methods ----------------------------------------------------
 

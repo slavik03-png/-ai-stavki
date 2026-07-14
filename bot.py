@@ -12,13 +12,21 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 # Only the orchestration package is imported here -- never tracking/ or
 # selection_engine/ directly (see tests/test_selection_isolation.py and
 # tests/test_tracking_bot_isolation.py, which assert this boundary).
-# The bot uses the fixture-discovery-first value-detection strategy
-# (ai_predictions/value_pipeline.py): real fixtures come from API-Football
-# first, The Odds API is queried only for what those fixtures need, and
-# statistics enrichment blends into the market probability when real form
-# data is available. ai_predictions/pipeline.py (the older statistics-only
-# strategy) stays available separately.
-from ai_predictions.value_pipeline import run_value_predictions
+#
+# Production v3 (2026-07-14): the bot's "🤖 Прогнозы ИИ" button runs the
+# API-Football-only pipeline (ai_predictions/football_pipeline.py).
+# API-Football is the primary and sufficient data source for
+# recommendations; The Odds API is purely optional coefficient enrichment
+# and can never block or reduce recommendations (see that module's
+# docstring). The older odds-driven fixture-discovery-first pipeline
+# (ai_predictions/value_pipeline.py) stays available/tested but is no
+# longer wired into the bot, since it produces zero candidates whenever
+# The Odds API quota is exhausted -- exactly the failure this version
+# fixes.
+from ai_predictions.football_cache import FootballCache
+from ai_predictions.football_pipeline import run_football_predictions
+from ai_predictions.fixtures import discover_fixtures_in_window
+from ai_predictions.value_config import FIXTURE_LIST_CACHE_TTL_HOURS
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
@@ -79,6 +87,11 @@ ai_predictions_lock = asyncio.Lock()
 # prediction message. Kept separately so /status can report the last
 # real run even after the 30-minute prediction cache itself expires.
 ai_predictions_last_diagnostics: Optional[Dict[str, Any]] = None
+
+# UTC timestamp (float) of the last successful "🤖 Прогнозы ИИ" run, for
+# the required /status "last successful prediction run" field. None until
+# the first successful run since the process started.
+ai_predictions_last_success_ts: Optional[float] = None
 
 
 def main_keyboard() -> InlineKeyboardMarkup:
@@ -238,13 +251,11 @@ async def _send_cached_predictions(query) -> None:
 async def handle_ai_predictions(query) -> None:
     global ai_predictions_cache, ai_predictions_last_diagnostics
 
-    if not ODDS_API_KEY or not FOOTBALL_API_KEY:
-        missing = ", ".join(
-            name for name, present in (("ODDS_API_KEY", ODDS_API_KEY), ("FOOTBALL_API_KEY", FOOTBALL_API_KEY))
-            if not present
-        )
+    # API-Football is the only REQUIRED key -- The Odds API is optional
+    # coefficient enrichment only (production v3).
+    if not FOOTBALL_API_KEY:
         await query.message.reply_text(
-            f"❌ Для прогнозов ИИ нужны ключи: {missing}.",
+            "❌ Для прогнозов ИИ нужен ключ: FOOTBALL_API_KEY.",
             reply_markup=main_keyboard(),
         )
         return
@@ -267,81 +278,129 @@ async def handle_ai_predictions(query) -> None:
             await _send_cached_predictions(query)
             return
 
-        if last_known_credits is not None and last_known_credits < MIN_CREDITS_FOR_AI_PREDICTIONS:
-            await query.message.reply_text(
-                "⚠️ Слишком мало кредитов The Odds API "
-                f"(осталось: {last_known_credits}). Запрос прогнозов ИИ отменён, "
-                "чтобы не исчерпать лимит.",
-                reply_markup=main_keyboard(),
-            )
-            return
-
+        # Odds API credits never gate this button any more -- API-Football
+        # is sufficient on its own; The Odds API is optional enrichment.
         await query.message.reply_text(
-            "🤖 Анализирую матчи ближайших 36 часов (реальные коэффициенты нескольких букмекеров)... "
+            "🤖 Анализирую матчи ближайших 36 часов по данным API-Football... "
             "Это может занять минуту."
         )
         try:
-            result = await asyncio.to_thread(run_value_predictions)
+            global ai_predictions_last_success_ts
+            result = await asyncio.to_thread(run_football_predictions)
             messages = result.telegram_messages or ["На ближайшие 36 часов подходящих сигналов не найдено."]
+            now_ts2 = datetime.now(timezone.utc).timestamp()
             ai_predictions_cache = {
                 "messages": messages,
-                "timestamp": datetime.now(timezone.utc).timestamp(),
+                "timestamp": now_ts2,
             }
-            # Full technical diagnostics (discovery, validation counts, API
-            # errors, etc.) are kept only for /status -- never sent here.
+            # Full technical diagnostics are kept only for /status -- never
+            # sent here.
             ai_predictions_last_diagnostics = {
-                "diagnostics": result.diagnostics,
-                "api_error_summary": result.api_error_summary,
-                "high_count": result.high_count,
-                "medium_count": result.medium_count,
-                "low_count": result.low_count,
-                "timestamp": datetime.now(timezone.utc).timestamp(),
+                "found_fixtures": result.found_fixtures,
+                "analysed_fixtures": result.analysed_fixtures,
+                "recommendations_count": result.recommendations_count,
+                "api_football_requests_used": result.api_football_requests_used,
+                "api_football_requests_remaining": result.api_football_requests_remaining,
+                "odds_status": result.odds_status,
+                "errors": result.errors,
+                "timestamp": now_ts2,
             }
+            ai_predictions_last_success_ts = now_ts2
             for message in messages:
                 await query.message.reply_text(message, reply_markup=main_keyboard())
         except Exception as e:
             await query.message.reply_text(f"❌ Ошибка при формировании прогнозов ИИ: {e}", reply_markup=main_keyboard())
 
 
+def _format_ago(now_dt: datetime, then_dt: datetime) -> str:
+    delta = now_dt - then_dt
+    hours = delta.total_seconds() / 3600.0
+    if hours < 1:
+        return f"{int(delta.total_seconds() / 60)} мин назад"
+    return f"{hours:.1f} ч назад"
+
+
+def _odds_api_status_text() -> str:
+    """Best-effort, cheap tri-state read for /status -- reuses the last
+    known diagnostic status from the most recent run rather than making a
+    fresh Odds API call just to render /status."""
+    if not ODDS_API_KEY:
+        return "недоступен (не задан ключ)"
+    if ai_predictions_last_diagnostics:
+        status = ai_predictions_last_diagnostics.get("odds_status")
+        if status == "quota_exhausted":
+            return "квота исчерпана"
+        if status == "available":
+            return "доступен"
+        if status == "unavailable":
+            return "недоступен"
+    return "неизвестно (ещё не было запросов)"
+
+
 def build_status_text() -> str:
     """All technical/diagnostic information lives here -- the normal
-    prediction message never shows any of this (see
-    render_telegram_signals_message)."""
-    ok_bot = "✅" if TELEGRAM_BOT_TOKEN else "❌"
-    ok_odds = "✅" if ODDS_API_KEY else "❌"
-    ok_football = "✅" if FOOTBALL_API_KEY else "❌"
-    credits_text = str(last_known_credits) if last_known_credits is not None else "неизвестно (ещё не было запросов)"
-    ai_predictions_status = "нет данных" if not ai_predictions_cache else "есть (обновится в течение 30 минут)"
+    prediction message never shows any of this. Fields match the
+    production-fix spec's required /status list exactly: Telegram token,
+    API-Football key, API-Football requests remaining, fixture cache age,
+    fixtures found in the next 36h, Odds API tri-state, last successful
+    run."""
+    ok_bot = "доступен" if TELEGRAM_BOT_TOKEN else "отсутствует"
+    ok_football = "доступен" if FOOTBALL_API_KEY else "отсутствует"
+
+    now_dt = datetime.now(timezone.utc)
+    requests_remaining_text = "неизвестно"
+    fixture_cache_age_text = "нет данных (ещё не запрашивались)"
+    fixtures_found_text = "неизвестно (ещё не было запросов)"
+
+    if FOOTBALL_API_KEY:
+        try:
+            football_cache = FootballCache(now=now_dt)
+            requests_remaining_text = str(football_cache.requests_available())
+            discovery = discover_fixtures_in_window(FOOTBALL_API_KEY, football_cache, now_dt)
+            fixtures_found_text = str(len(discovery.fixtures))
+            newest_cached_at = None
+            for date_str in discovery.dates_queried:
+                cached_at = football_cache.cached_at(f"fixtures:date:{date_str}")
+                if cached_at is not None and (newest_cached_at is None or cached_at > newest_cached_at):
+                    newest_cached_at = cached_at
+            if newest_cached_at is not None:
+                fixture_cache_age_text = _format_ago(now_dt, newest_cached_at)
+            football_cache.close()
+        except Exception:
+            pass
+
+    last_run_text = (
+        _format_ago(now_dt, datetime.fromtimestamp(ai_predictions_last_success_ts, tz=timezone.utc))
+        if ai_predictions_last_success_ts is not None
+        else "ещё не было успешных запусков"
+    )
 
     lines = [
         "ℹ️ Статус AI Ставки",
         "",
         f"Telegram token: {ok_bot}",
-        f"The Odds API key: {ok_odds}",
         f"API-Football key: {ok_football}",
-        f"Осталось кредитов The Odds API: {credits_text}",
+        f"Осталось запросов к API-Football сегодня: {requests_remaining_text}",
+        f"Возраст кэша фикстур: {fixture_cache_age_text}",
+        f"Найдено матчей в ближайшие 36 часов: {fixtures_found_text}",
+        f"The Odds API: {_odds_api_status_text()}",
+        f"Последний успешный запуск прогнозов ИИ: {last_run_text}",
         "",
-        "Кэш (хранится 30 минут):",
+        "Кэш линии (хранится 30 минут):",
         cache_status_lines(),
-        f"{CACHE_LABELS_AI_PREDICTIONS}: {ai_predictions_status}",
     ]
 
     if ai_predictions_last_diagnostics:
-        diag = ai_predictions_last_diagnostics.get("diagnostics")
         lines.append("")
         lines.append("Прогнозы ИИ — последний запуск:")
-        if diag is not None:
-            lines.append(f"Турниров обнаружено: {len(diag.sports_discovered)}")
-            lines.append(f"Турниров успешно опрошено: {len(diag.sports_queried)}")
-            lines.append(f"Событий в окне 36ч: {diag.events_in_window}")
         lines.append(
-            f"Сигналов: HIGH — {ai_predictions_last_diagnostics.get('high_count', 0)}, "
-            f"MEDIUM — {ai_predictions_last_diagnostics.get('medium_count', 0)}, "
-            f"LOW — {ai_predictions_last_diagnostics.get('low_count', 0)}"
+            f"Найдено: {ai_predictions_last_diagnostics.get('found_fixtures', 0)}, "
+            f"проанализировано: {ai_predictions_last_diagnostics.get('analysed_fixtures', 0)}, "
+            f"рекомендаций: {ai_predictions_last_diagnostics.get('recommendations_count', 0)}"
         )
-        error_summary = ai_predictions_last_diagnostics.get("api_error_summary")
-        if error_summary:
-            lines.append(error_summary)
+        run_errors = ai_predictions_last_diagnostics.get("errors")
+        if run_errors:
+            lines.append(f"Примечания: {'; '.join(run_errors[:3])}")
 
     return "\n".join(lines)
 

@@ -231,3 +231,67 @@ PROBABILITY_BLEND_WEIGHTS = {
 #: an honest, auditable estimate rather than a forced "attractive" figure.
 PROBABILITY_CLAMP_MIN = 0.02
 PROBABILITY_CLAMP_MAX = 0.98
+
+# ---------------------------------------------------------------------------
+# Production version 3 (2026-07-14): API-Football becomes the PRIMARY and
+# SUFFICIENT data source for recommendations. The Odds API becomes purely
+# optional coefficient enrichment -- its absence, quota exhaustion, or any
+# HTTP error must never block or reduce the number of recommendations
+# produced. See ai_predictions/football_pipeline.py.
+# ---------------------------------------------------------------------------
+
+#: How long a discovered fixture list stays valid before a fresh
+#: API-Football fixture query is allowed for the same date -- deliberately
+#: shorter than API_FOOTBALL_CACHE_TTL_HOURS (used for team stats/
+#: predictions, which change less often) per the explicit "cache fixtures
+#: for 6 hours" requirement.
+FIXTURE_LIST_CACHE_TTL_HOURS = 6
+
+#: Signal thresholds for the API-Football-only probability model (Section
+#: 5 of the production fix spec). Exactly the suggested thresholds --
+#: nothing invented.
+PROB_HIGH_MIN = 0.72
+PROB_MEDIUM_MIN = 0.64
+PROB_LOW_MIN = 0.56
+
+#: HIGH additionally requires "good data completeness" -- defined here as
+#: at least this fraction of the inputs the market's probability depends
+#: on being real, retrieved data (see football_predictions.py for how
+#: completeness is computed per market).
+PROB_HIGH_MIN_COMPLETENESS = 0.6
+
+#: Upper bound on how many discovered fixtures are actually sent through
+#: real API-Football analysis calls (predictions + recent form) in one
+#: run. Protects the free-plan daily quota: worst case is 3 real requests
+#: per newly-analysed fixture (1 predictions + 2 team-form calls), so this
+#: cap keeps a single run's worst-case spend well inside
+#: API_FOOTBALL_DAILY_QUOTA - API_FOOTBALL_QUOTA_RESERVE even before the
+#: cache/quota-reserve checks kick in. Fixtures are analysed soonest-
+#: kickoff first; any fixture beyond this cap is honestly reported as
+#: "found but not analysed", never silently dropped.
+MAX_FIXTURES_ANALYSED_PER_RUN = 25
+
+#: Real, understandable betting markets this production version creates
+#: candidates for (Section 3 of the spec). Every key here must have a
+#: corresponding honest probability-derivation path in
+#: ai_predictions/football_predictions.py -- no market is ever added here
+#: without one.
+SUPPORTED_BET_MARKETS = (
+    "home_win", "draw", "away_win", "double_chance_1x", "double_chance_x2",
+    "over_1_5", "over_2_5", "under_3_5", "btts_yes", "btts_no",
+)
+
+#: Russian display label for each supported market (used on the Telegram
+#: card's "Ставка:" line).
+BET_MARKET_LABELS_RU = {
+    "home_win": "Победа хозяев",
+    "draw": "Ничья",
+    "away_win": "Победа гостей",
+    "double_chance_1x": "1X",
+    "double_chance_x2": "X2",
+    "over_1_5": "Тотал больше 1.5",
+    "over_2_5": "Тотал больше 2.5",
+    "under_3_5": "Тотал меньше 3.5",
+    "btts_yes": "Обе забьют — да",
+    "btts_no": "Обе забьют — нет",
+}

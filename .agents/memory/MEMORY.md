@@ -8,3 +8,4 @@
 - [Value-divergence strategy design](value-divergence-strategy.md) covers global top-5 selection AND the fixture-discovery-first pipeline (API-Football fixtures drive everything; Odds API is scoped/matched to them, never the other way round).
 - [Telegram output: concise vs diagnostics split](telegram-concise-vs-diagnostics.md) — user-facing signal message and technical diagnostics are two separate render functions; never merge them back into one.
 - [Display selection vs canonical settlement token](display-vs-canonical-selection.md) — ValueCandidate.selection is a display string, but settlement matches canonical tokens; translate only in rendering, never mutate the stored field.
+- [API-Football-primary production architecture (v3)](api-football-primary-architecture.md) — Odds API must never gate candidate creation, only optional price display; quota reserve is patched via football_cache's own namespace, not value_config's.

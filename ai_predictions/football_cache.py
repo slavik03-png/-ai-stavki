@@ -73,10 +73,13 @@ class FootballCache:
 
     # -- 24h cache -----------------------------------------------------------
 
-    def get(self, cache_key: str) -> Optional[Any]:
+    def get(self, cache_key: str, *, ttl_hours: Optional[float] = None) -> Optional[Any]:
         """Returns the cached payload if it exists and is within the TTL,
         else None (a miss -- expired entries are never returned, but are
-        left in place; they get overwritten by the next real `set`)."""
+        left in place; they get overwritten by the next real `set`).
+        `ttl_hours` overrides the default API_FOOTBALL_CACHE_TTL_HOURS for
+        callers with their own explicit freshness requirement (e.g. the 6h
+        fixture-list cache -- see value_config.FIXTURE_LIST_CACHE_TTL_HOURS)."""
         with self._lock:
             row = self._conn.execute(
                 "SELECT payload_json, cached_at FROM cache_entries WHERE cache_key = ?",
@@ -89,9 +92,25 @@ class FootballCache:
             cached_dt = datetime.datetime.fromisoformat(cached_at)
         except ValueError:
             return None
-        if self._now - cached_dt > datetime.timedelta(hours=API_FOOTBALL_CACHE_TTL_HOURS):
+        ttl = API_FOOTBALL_CACHE_TTL_HOURS if ttl_hours is None else ttl_hours
+        if self._now - cached_dt > datetime.timedelta(hours=ttl):
             return None
         return json.loads(payload_json)
+
+    def cached_at(self, cache_key: str) -> Optional[datetime.datetime]:
+        """Raw cache timestamp for diagnostics (e.g. /status "fixture
+        cache age") -- ignores TTL entirely, unlike `get()`, so a caller
+        can report "this entry is N hours old" even once expired."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT cached_at FROM cache_entries WHERE cache_key = ?", (cache_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            return datetime.datetime.fromisoformat(row[0])
+        except ValueError:
+            return None
 
     def set(self, cache_key: str, payload: Any) -> None:
         with self._lock, self._conn:

@@ -35,6 +35,7 @@ from ai_predictions.football_cache import FootballCache
 from ai_predictions.value_config import (
     FIXTURE_CANCELLED_STATUSES,
     FIXTURE_FINISHED_STATUSES,
+    FIXTURE_LIST_CACHE_TTL_HOURS,
     FIXTURE_LIVE_STATUSES,
     FIXTURE_NOT_STARTED_STATUSES,
     FIXTURE_POSTPONED_STATUSES,
@@ -151,7 +152,7 @@ def discover_fixtures_in_window(
 
     for date_str in dates:
         cache_key = f"fixtures:date:{date_str}"
-        cached = cache.get(cache_key)
+        cached = cache.get(cache_key, ttl_hours=FIXTURE_LIST_CACHE_TTL_HOURS)
         raw_fixtures: Optional[List[Dict[str, Any]]] = None
         if cached is not None:
             raw_fixtures = cached
