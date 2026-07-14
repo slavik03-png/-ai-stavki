@@ -60,6 +60,26 @@ the smallest real unit of network cost (one HTTP call), read persistent
 cache first, and provide a clearly-labelled reduced-confidence fallback
 rather than an early `break`/abort of the whole batch.
 
+## Per-item cache TTL is not the same as "never recompute the final result"
+
+A requirement like "don't hit the API again for N hours" needs its own
+persisted, TTL-stamped archive entry holding the *final computed output*
+(the assembled Telegram messages + diagnostics), separate from the
+existing per-item caches (fixtures/predictions/team-stats). Otherwise a
+repeat request still re-runs the whole analysis loop and can still touch
+the network for anything not yet cached, even though each individual item
+technically has a TTL.
+
+**Why:** per-item caches answer "is this one ingredient stale", not "has
+the final recommendation already been computed for this window" — those
+are different questions with different lifetimes.
+
+**How to apply:** store the finished result (not just its ingredients)
+under one dedicated cache key with its own TTL; check that key first and
+short-circuit before touching any per-item cache or network call at all.
+Layer a short-TTL "refresh in progress" marker key alongside it for
+cross-process locking, on top of any in-process asyncio.Lock.
+
 ## Daily quota reserve vs. hard cap
 
 `ai_predictions/football_cache.py`'s `API_FOOTBALL_QUOTA_RESERVE` is an
