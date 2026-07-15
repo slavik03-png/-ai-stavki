@@ -6,12 +6,15 @@ prediction_selector.py, odds_lookup.py, prediction_report.py).
 Covers exactly the required scenarios from the urgent production-fix
 spec:
 1. fixtures are obtained from API-Football even when The Odds API quota is zero;
-2. HTTP 401 from The Odds API does not block recommendations;
-3. recommendations are produced with "Коэффициент: нет данных";
+2. HTTP 401 from The Odds API does not block fixture discovery/analysis;
+3. a recommendation with no real, matched bookmaker price is dropped
+   entirely (never shown with a placeholder "нет данных" coefficient);
 4. only fixtures in the strict 36-hour window are used;
-5. no fabricated fixtures or probabilities are produced;
-6. Russian Telegram cards follow the required format;
-7. bookmaker names and technical diagnostics are absent from user-facing cards.
+5. no fabricated fixtures, probabilities or coefficients are produced;
+6. Russian Telegram cards follow the required format, including the real
+   bookmaker name that supplied the shown coefficient;
+7. internal technical diagnostics (quota, HTTP, pipeline internals) are
+   absent from user-facing cards.
 
 No real network calls anywhere in this file.
 """
@@ -225,8 +228,10 @@ def test_pipeline_produces_recommendations_with_zero_odds_quota():
 
     def fake_lookup(fixtures, market_map, *, odds_api_key, persistent_cache=None):
         # Simulates The Odds API HTTP 401 / exhausted quota -- must not
-        # raise and must not block recommendations.
-        return OddsLookupResult(prices_by_fixture={}, status="quota_exhausted", detail="HTTP 401")
+        # raise and must not block fixture discovery/analysis, but per the
+        # mandatory real-odds gate, a candidate with no real price must
+        # still be dropped rather than shown.
+        return OddsLookupResult(prices_by_fixture={}, bookmaker_by_fixture={}, status="quota_exhausted", detail="HTTP 401")
 
     import football.providers.api_football as api_football_mod
     orig_discover = football_pipeline_mod.discover_fixtures_in_window
@@ -244,11 +249,18 @@ def test_pipeline_produces_recommendations_with_zero_odds_quota():
         cache.close()
 
         check("fixtures found via API-Football alone", result.found_fixtures == 1)
-        check("recommendation produced despite zero Odds API quota", result.recommendations_count >= 1)
-        check("odds_status reflects quota exhaustion, doesn't block", result.odds_status == "quota_exhausted")
         check("no coefficient attached", result.odds_by_fixture == {})
-        check("telegram message mentions 'нет данных' for coefficient",
-              any("нет данных" in m for m in result.telegram_messages))
+        check(
+            "recommendation dropped entirely when no real coefficient is found "
+            "(never shown without a real, matched bookmaker price)",
+            result.recommendations_count == 0,
+        )
+        check("dropped candidate is counted as excluded for no real odds", result.excluded_no_real_odds_count >= 1)
+        check("odds_status reflects quota exhaustion, doesn't crash the run", result.odds_status == "quota_exhausted")
+        check("telegram message honestly explains no real coefficient was found, never a placeholder",
+              any("реальн" in m and "коэффициент" in m for m in result.telegram_messages))
+        check("no 'нет данных' placeholder is ever shown",
+              not any("нет данных" in m for m in result.telegram_messages))
         storage.close()
     finally:
         football_pipeline_mod.discover_fixtures_in_window = orig_discover
@@ -271,7 +283,10 @@ def test_card_format_and_no_technical_leakage():
     )
     from ai_predictions.prediction_selector import RankedRecommendation
     rec = RankedRecommendation(candidate=candidate, signal_level="MEDIUM")
-    messages = render_predictions_message([rec], {}, found_fixtures=12, analysed_fixtures=8)
+    odds_by_fixture = {fixture.fixture_id: (1.85, "Pinnacle")}
+    messages = render_predictions_message(
+        [rec], odds_by_fixture, found_fixtures=12, analysed_fixtures=8,
+    )
 
     check("heading present", messages[0].startswith(HEADING))
     check("Found/Analysed/Selected counts present", "Найдено матчей: 12" in messages[0]
@@ -280,14 +295,15 @@ def test_card_format_and_no_technical_leakage():
     card = messages[1]
     for required in (
         "⚽ ПРОГНОЗ №1", "🌍 Страна:", "🏆 Турнир:", "👥 Матч:", "🕒 Начало:",
-        "🎯 Ставка:", "📊 Расчётная вероятность:", "💰 Ориентировочный коэффициент:",
+        "🎯 Ставка:", "📊 Расчётная вероятность:", "💰 Коэффициент:",
         "Уровень сигнала:", "Краткое объяснение:",
     ):
         check(f"card contains '{required}'", required in card, card)
-    check("card shows 'нет данных' coefficient", "Ориентировочный коэффициент: нет данных" in card)
+    check("card shows the real coefficient and the real bookmaker it came from",
+          "Коэффициент: 1,85 (Pinnacle)" in card)
+    check("no 'нет данных' placeholder ever shown on a rendered card", "нет данных" not in card)
     check("card shows whole-percent probability", "68%" in card)
     check("signal level shown as a plain Russian word, not a raw code", "средний" in card and "MEDIUM" not in card)
-    check("no bookmaker name leaked", "BookA" not in card and "bookmaker" not in card.lower())
     check(
         "card never uses the internal rationale text (avoids leaking API-Football/quota/pipeline wording)",
         candidate.rationale not in card,
@@ -297,6 +313,21 @@ def test_card_format_and_no_technical_leakage():
                                    "fixture", "fallback", "pipeline", "provider")
     ))
     check("disclaimer shown once, after the cards", messages[-1].startswith("ℹ️") and "аналитической оценкой" in messages[-1])
+
+
+def test_no_recommendations_survive_probability_but_none_have_real_odds():
+    """When candidates clear the probability threshold but none of them
+    has a real, matched bookmaker price, the message must honestly say
+    so -- never a placeholder card, never the generic 'no signal' text
+    (which specifically means 'probability too low', a different, false
+    reason)."""
+    messages = render_predictions_message(
+        [], {}, found_fixtures=10, analysed_fixtures=10, candidates_without_odds=3,
+    )
+    check("exactly one message returned", len(messages) == 1)
+    check("message explains missing real odds, not low probability",
+          "реальн" in messages[0] and "коэффициент" in messages[0] and "56%" not in messages[0])
+    check("count of odds-excluded candidates is mentioned", "3" in messages[0])
 
 
 def test_double_chance_markets_spelled_out_in_russian():
@@ -325,10 +356,9 @@ def test_odds_formatted_with_russian_comma():
         probability=0.7, completeness=0.9, sample_size_category="strong", rationale="r", source="api_football_predictions",
     )
     rec = RankedRecommendation(candidate=candidate, signal_level="HIGH")
-    card = render_recommendation_card(1, rec, 1.65)
+    card = render_recommendation_card(1, rec, 1.65, "1xBet")
     check("odds shown with a comma, not a dot", "1,65" in card and "1.65" not in card)
-    card_no_odds = render_recommendation_card(1, rec, None)
-    check("missing odds shown honestly as 'нет данных', never a bookmaker name", "нет данных" in card_no_odds)
+    check("real bookmaker name shown on the card", "1xBet" in card)
 
 
 def test_utc_to_yekaterinburg_time_conversion():

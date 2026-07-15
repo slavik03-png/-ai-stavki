@@ -5,15 +5,20 @@ runs (ai_predictions/football_predictions.py + prediction_selector.py) --
 this module only tries, best-effort, to attach a real bookmaker price to
 each chosen recommendation for display. ANY failure here (no
 ODDS_API_KEY, HTTP 401, exhausted quota, network error, no matching
-event, no matching outcome) must degrade to `odds=None` ("Коэффициент:
-нет данных" on the card) and must never raise, never block, and never
-reduce the recommendation list built before this module ran.
+event, no matching outcome) must degrade to `odds=None`, never raise and
+never invent a price.
+
+Unlike earlier versions, a missing real coefficient is no longer shown as
+a placeholder ("нет данных") -- the caller (football_pipeline.py) drops
+that recommendation entirely instead of showing it without a real,
+named bookmaker price. This module's only job is to report the truth:
+either a real (price, bookmaker) pair, or nothing for that fixture.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
 from ai_predictions.fixture_matching import FixtureMatch, match_fixtures_to_events
 from ai_predictions.fixtures import Fixture
@@ -34,18 +39,30 @@ class OddsLookupResult:
     prices_by_fixture: Dict[int, float]
     status: str  # "available" | "quota_exhausted" | "unavailable"
     detail: Optional[str] = None
+    #: Which real bookmaker (The Odds API's own `title` for that price) the
+    #: best price in `prices_by_fixture` actually came from -- always set
+    #: together with a price, never guessed or defaulted to a generic label.
+    bookmaker_by_fixture: Dict[int, str] = field(default_factory=dict)
 
 
 def _quota_exhausted(errors: List[str]) -> bool:
     return any("ODDS_API_QUOTA_EXHAUSTED" in e or "401" in e for e in errors)
 
 
-def _best_price_for_market(event: Dict[str, Any], fixture: Fixture, market_key: str) -> Optional[float]:
+def _best_price_for_market(
+    event: Dict[str, Any], fixture: Fixture, market_key: str,
+) -> Optional[Tuple[float, str]]:
+    """Returns (best_price, bookmaker_title) for the requested market, or
+    None if no real bookmaker in this event actually quotes it. The
+    bookmaker title is The Odds API's own `title` field for whichever
+    real bookmaker offered the best price -- never a placeholder."""
     home = normalize_text(fixture.home_team)
     away = normalize_text(fixture.away_team)
     best: Optional[float] = None
+    best_bookmaker: Optional[str] = None
 
     for bookmaker in event.get("bookmakers", []) or []:
+        bookmaker_title = bookmaker.get("title") or "?"
         for market in bookmaker.get("markets", []) or []:
             odds_market_key = market.get("key")
             for outcome in market.get("outcomes", []) or []:
@@ -89,7 +106,10 @@ def _best_price_for_market(event: Dict[str, Any], fixture: Fixture, market_key: 
 
                 if matched and (best is None or price > best):
                     best = price
-    return best
+                    best_bookmaker = bookmaker_title
+    if best is None:
+        return None
+    return best, best_bookmaker
 
 
 def lookup_coefficients(
@@ -121,12 +141,15 @@ def lookup_coefficients(
 
     match_result = match_fixtures_to_events(fixtures, fetch_result.events)
     prices: Dict[int, float] = {}
+    bookmakers: Dict[int, str] = {}
     for match in match_result.matches:
         market_key = fixture_market_keys.get(match.fixture.fixture_id)
         if not market_key:
             continue
-        price = _best_price_for_market(match.event, match.fixture, market_key)
-        if price is not None:
+        found = _best_price_for_market(match.event, match.fixture, market_key)
+        if found is not None:
+            price, bookmaker_title = found
             prices[match.fixture.fixture_id] = price
+            bookmakers[match.fixture.fixture_id] = bookmaker_title
 
-    return OddsLookupResult(prices_by_fixture=prices, status="available")
+    return OddsLookupResult(prices_by_fixture=prices, bookmaker_by_fixture=bookmakers, status="available")

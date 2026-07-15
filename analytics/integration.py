@@ -19,12 +19,17 @@ logger = logging.getLogger(__name__)
 
 
 def record_recommendation(
-    analytics_storage: AnalyticsStorage, rec: Any, odds: Optional[float], *,
+    analytics_storage: AnalyticsStorage, rec: Any, odds: float, *,
     model_version: str, archive_version: str, now: Optional[datetime.datetime] = None,
 ) -> None:
     """`rec` is a RankedRecommendation from ai_predictions/prediction_selector.py
     (has .candidate and .signal_level); never imported by type here to avoid
-    a hard dependency cycle -- only the attributes actually used are read."""
+    a hard dependency cycle -- only the attributes actually used are read.
+
+    `odds` must be a real, confirmed bookmaker price. Callers only ever
+    record a recommendation that already survived the real-odds gate in
+    football_pipeline.run_football_predictions, so this never fabricates
+    an implied-probability price for a missing real coefficient."""
     try:
         c = rec.candidate
         fixture = c.fixture
@@ -39,13 +44,13 @@ def record_recommendation(
             "market": c.market_key,
             "market_label": MARKET_LABELS_RU.get(c.market_key, c.market_label_ru),
             "selection": c.market_key,
-            "odds": odds if odds is not None else (round(1.0 / c.probability, 4) if c.probability > 0 else None),
+            "odds": odds,
             "estimated_probability": c.probability,
             "signal_level": rec.signal_level,
             "reason": c.rationale,
             "model_version": model_version,
             "archive_version": archive_version,
-            "prediction_source": "api_football" if odds is None else "api_football+the_odds_api",
+            "prediction_source": "api_football+the_odds_api",
         }
         analytics_storage.record_prediction(row)
     except Exception:  # never let analytics recording break the real pipeline

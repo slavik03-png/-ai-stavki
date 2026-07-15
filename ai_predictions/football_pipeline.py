@@ -83,6 +83,12 @@ class FootballPipelineResult:
     fixture_discovery: Optional[FixtureDiscoveryResult] = None
     recommendations: List[RankedRecommendation] = field(default_factory=list)
     odds_by_fixture: Dict[int, float] = field(default_factory=dict)
+    bookmaker_by_fixture: Dict[int, str] = field(default_factory=dict)
+    #: Candidates that cleared the probability threshold but were dropped
+    #: because no real bookmaker actually quotes that event+market right
+    #: now -- never shown, saved or recorded (see the real-odds gate in
+    #: run_football_predictions).
+    excluded_no_real_odds_count: int = 0
     saved_count: int = 0
     duplicate_count: int = 0
     errors: List[str] = field(default_factory=list)
@@ -210,11 +216,14 @@ def is_refresh_in_progress(football_cache: FootballCache, now: datetime.datetime
     return football_cache.get(DAILY_ARCHIVE_LOCK_KEY, ttl_hours=DAILY_ARCHIVE_LOCK_TTL_MINUTES / 60.0) is not None
 
 
-def _recommendation_to_prediction(rec: RankedRecommendation, odds: Optional[float]) -> Prediction:
+def _recommendation_to_prediction(rec: RankedRecommendation, odds: float) -> Prediction:
+    """`odds` must be a real, confirmed bookmaker price -- callers only
+    ever reach this for recommendations that survived the real-odds
+    filter in run_football_predictions (a recommendation with no real
+    price is dropped before persistence, never given a fabricated
+    implied-probability price here)."""
     c = rec.candidate
     fixture = c.fixture
-    has_real_odds = odds is not None
-    bookmaker_odds = odds if has_real_odds else round(1.0 / c.probability, 4) if c.probability > 0 else 1.0
     explanation = c.rationale
     return Prediction(
         sport="football",
@@ -227,13 +236,13 @@ def _recommendation_to_prediction(rec: RankedRecommendation, odds: Optional[floa
         market_type=c.market_key,
         market_name=BET_MARKET_LABELS_RU.get(c.market_key, c.market_key),
         selection=c.market_key,
-        bookmaker_odds=bookmaker_odds,
+        bookmaker_odds=odds,
         model_probability=c.probability,
         confidence_score=round(c.probability * 100.0, 1),
         confidence_level=c.sample_size_category,
         recommendation_group=_LEVEL_TO_RECOMMENDATION_GROUP.get(rec.signal_level, "high_risk"),
         explanation=explanation,
-        data_provider="api_football" if not has_real_odds else "api_football+the_odds_api",
+        data_provider="api_football+the_odds_api",
         model_version=FOOTBALL_PIPELINE_MODEL_VERSION,
         status=STATUS_PENDING,
         signal_level=rec.signal_level,
@@ -312,28 +321,55 @@ def run_football_predictions(
     result.api_football_requests_remaining = football_cache.requests_available()
     result.api_football_requests_used_today = football_cache.requests_used_today()
 
-    ranked = select_recommendations(all_candidates)
-    result.recommendations = ranked
-    result.recommendations_count = len(ranked)
+    candidate_recommendations = select_recommendations(all_candidates)
 
-    fixture_market_keys = {rec.candidate.fixture.fixture_id: rec.candidate.market_key for rec in ranked}
-    fixtures_for_lookup = [rec.candidate.fixture for rec in ranked]
+    fixture_market_keys = {
+        rec.candidate.fixture.fixture_id: rec.candidate.market_key for rec in candidate_recommendations
+    }
+    fixtures_for_lookup = [rec.candidate.fixture for rec in candidate_recommendations]
     try:
         odds_result = lookup_coefficients(fixtures_for_lookup, fixture_market_keys, odds_api_key=odds_api_key)
     except Exception as exc:  # never let optional enrichment break the run
         odds_result = OddsLookupResult(prices_by_fixture={}, status="unavailable", detail=str(exc))
     result.odds_status = odds_result.status
     result.odds_by_fixture = odds_result.prices_by_fixture
+    result.bookmaker_by_fixture = odds_result.bookmaker_by_fixture
 
+    # Mandatory real-odds gate: a recommendation is only ever shown, saved
+    # or recorded when a real bookmaker actually quotes that exact event
+    # and market right now. No placeholder/estimated coefficient is ever
+    # substituted -- a candidate with no real, matched price is dropped
+    # here, before rendering, storage or analytics ever see it.
+    pre_odds_filter_count = len(candidate_recommendations)
+    ranked = [
+        rec for rec in candidate_recommendations
+        if rec.candidate.fixture.fixture_id in odds_result.prices_by_fixture
+    ]
+    result.recommendations = ranked
+    result.recommendations_count = len(ranked)
+    result.excluded_no_real_odds_count = pre_odds_filter_count - len(ranked)
+    if result.excluded_no_real_odds_count:
+        logger.info(
+            "football_pipeline.recommendations_excluded_no_real_odds count=%d "
+            "(candidates that passed the probability threshold but had no real, "
+            "matched bookmaker price -- dropped rather than shown with a placeholder)",
+            result.excluded_no_real_odds_count,
+        )
+
+    odds_and_bookmaker_by_fixture = {
+        fid: (price, odds_result.bookmaker_by_fixture.get(fid, "?"))
+        for fid, price in odds_result.prices_by_fixture.items()
+    }
     result.telegram_messages = render_predictions_message(
-        ranked, result.odds_by_fixture,
+        ranked, odds_and_bookmaker_by_fixture,
         found_fixtures=result.found_fixtures, analysed_fixtures=result.analysed_fixtures,
+        candidates_without_odds=result.excluded_no_real_odds_count,
     )
 
     archive_version = now.date().isoformat()
     saved, duplicates = 0, 0
     for rec in ranked:
-        odds = result.odds_by_fixture.get(rec.candidate.fixture.fixture_id)
+        odds = result.odds_by_fixture[rec.candidate.fixture.fixture_id]
         prediction = _recommendation_to_prediction(rec, odds)
         try:
             storage.save_prediction(prediction)

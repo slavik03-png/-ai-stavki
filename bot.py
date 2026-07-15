@@ -501,6 +501,7 @@ async def handle_ai_predictions(query, *, force_refresh: bool = False) -> None:
                     "analysed_fixtures": result.analysed_fixtures,
                     "fully_stat_fixtures": result.fully_stat_fixtures,
                     "recommendations_count": result.recommendations_count,
+                    "excluded_no_real_odds_count": result.excluded_no_real_odds_count,
                     "api_football_requests_used": result.api_football_requests_used,
                     "api_football_requests_remaining": result.api_football_requests_remaining,
                     "api_football_requests_used_today": result.api_football_requests_used_today,
@@ -588,12 +589,13 @@ def build_status_text() -> str:
         found_text = str(d.get("found_fixtures", "неизвестно"))
         fully_stat_text = str(d.get("fully_stat_fixtures", "неизвестно"))
         recs_text = str(d.get("recommendations_count", "неизвестно"))
+        excluded_no_odds_text = str(d.get("excluded_no_real_odds_count", 0))
         source_text = d.get("source", "неизвестно")
     else:
         archive_age_text = "нет данных (архив ещё не сформирован)"
         last_update_text = "ещё не было успешных обновлений"
         archive_state_text = "отсутствует"
-        found_text = fully_stat_text = recs_text = "0"
+        found_text = fully_stat_text = recs_text = excluded_no_odds_text = "0"
         source_text = "нет данных"
 
     lines = [
@@ -610,6 +612,7 @@ def build_status_text() -> str:
         f"Сохранено матчей: {found_text}",
         f"Матчей с полной статистикой: {fully_stat_text}",
         f"Сохранено рекомендаций: {recs_text}",
+        f"Исключено (нет реального коэффициента ни у одного букмекера): {excluded_no_odds_text}",
         f"Источник последнего ответа пользователю: {source_text}",
         f"The Odds API: {_odds_api_status_text()}",
         "",

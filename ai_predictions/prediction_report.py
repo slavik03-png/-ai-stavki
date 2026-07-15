@@ -17,7 +17,7 @@ build_status_text()), never mixed into these user-facing messages.
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from ai_predictions.prediction_selector import RankedRecommendation
 from ai_predictions.ru_translation import country_ru, league_ru, team_ru
@@ -27,6 +27,16 @@ from ai_predictions.window import format_card_time
 NO_SIGNAL_TEMPLATE = (
     "На ближайшие 36 часов найдено {count} матчей, но ни один вариант не достиг "
     "минимальной расчётной вероятности 56%. Слабые ставки бот не предлагает."
+)
+
+#: Shown when at least one candidate passed the probability threshold but
+#: none of them had a real, matched bookmaker coefficient -- the bot never
+#: shows a prediction without a confirmed real price, so these are
+#: dropped rather than shown with a placeholder.
+NO_ODDS_TEMPLATE = (
+    "На ближайшие 36 часов найдено {count} вариантов с достаточной расчётной вероятностью, "
+    "но ни один из них не найден в реальной линии букмекеров с подтверждённым коэффициентом. "
+    "Бот не показывает прогнозы без реального коэффициента."
 )
 
 HEADING = "🤖 ПРОГНОЗЫ ИИ НА БЛИЖАЙШИЕ 36 ЧАСОВ"
@@ -43,16 +53,18 @@ def render_no_signal_message(found_fixtures: int) -> str:
     return NO_SIGNAL_TEMPLATE.format(count=found_fixtures)
 
 
+def render_no_odds_message(candidates_without_odds: int) -> str:
+    return NO_ODDS_TEMPLATE.format(count=candidates_without_odds)
+
+
 def _format_probability(probability: float) -> str:
     return f"{round(probability * 100)}%"
 
 
-def _format_odds_ru(odds: Optional[float]) -> str:
-    """Russian decimal-comma formatting, e.g. 1,65 -- or the honest
-    'нет данных' when no real coefficient was found (never fabricated,
-    never a bookmaker name)."""
-    if odds is None:
-        return "нет данных"
+def _format_odds_ru(odds: float) -> str:
+    """Russian decimal-comma formatting, e.g. 1,65. Always a real price by
+    the time this is called -- callers only ever reach this with a
+    recommendation that already has a confirmed real bookmaker price."""
     return f"{odds:.2f}".replace(".", ",")
 
 
@@ -96,10 +108,17 @@ def _short_explanation_ru(candidate, signal_level: str) -> str:
     return " ".join(parts)
 
 
-def render_recommendation_card(index: int, recommendation: RankedRecommendation, odds: Optional[float]) -> str:
+def render_recommendation_card(
+    index: int, recommendation: RankedRecommendation, odds: float, bookmaker: str,
+) -> str:
     """Renders exactly one prediction as its own short, plain-Russian
     card. Kept as a standalone function (not inlined into the message
-    builder) so it can be reused/tested independently."""
+    builder) so it can be reused/tested independently.
+
+    `odds` and `bookmaker` must both be real, confirmed values -- a
+    recommendation without a real matched bookmaker price is never passed
+    here; the caller drops it before rendering (see
+    football_pipeline.run_football_predictions)."""
     c = recommendation.candidate
     fixture = c.fixture
     emoji = SIGNAL_EMOJI_RU_CARD[recommendation.signal_level]
@@ -119,7 +138,7 @@ def render_recommendation_card(index: int, recommendation: RankedRecommendation,
         f"🕒 Начало: {when}",
         f"🎯 Ставка: {c.market_label_ru}",
         f"📊 Расчётная вероятность: {_format_probability(c.probability)}",
-        f"💰 Ориентировочный коэффициент: {_format_odds_ru(odds)}",
+        f"💰 Коэффициент: {_format_odds_ru(odds)} ({bookmaker})",
         f"{emoji} Уровень сигнала: {word}",
         "",
         "Краткое объяснение:",
@@ -130,16 +149,31 @@ def render_recommendation_card(index: int, recommendation: RankedRecommendation,
 
 def render_predictions_message(
     recommendations: List[RankedRecommendation],
-    odds_by_fixture: dict,
+    odds_by_fixture: Dict[int, Tuple[float, str]],
     *,
     found_fixtures: int,
     analysed_fixtures: int,
+    candidates_without_odds: int = 0,
 ) -> List[str]:
     """Returns one or more Telegram message chunks: a short heading (with
     Found/Analysed/Selected counts), one card per recommendation, and a
-    closing disclaimer -- or the exact no-signal message alone if
-    `recommendations` is empty."""
+    closing disclaimer.
+
+    `odds_by_fixture` maps fixture_id -> (real_price, real_bookmaker_title)
+    and must already contain an entry for every recommendation passed in
+    -- the caller is responsible for dropping any recommendation that has
+    no real, matched bookmaker price before calling this function; this
+    module never shows a placeholder coefficient.
+
+    If `recommendations` is empty because nothing cleared the probability
+    threshold at all, the exact no-signal message is returned. If
+    `recommendations` is empty specifically because every threshold-passing
+    candidate had no real coefficient in any bookmaker's line
+    (`candidates_without_odds > 0`), a distinct, honest message is shown
+    instead."""
     if not recommendations:
+        if candidates_without_odds > 0:
+            return [render_no_odds_message(candidates_without_odds)]
         return [render_no_signal_message(found_fixtures)]
 
     header = (
@@ -149,7 +183,7 @@ def render_predictions_message(
         f"Отобрано прогнозов: {len(recommendations)}"
     )
     cards = [
-        render_recommendation_card(i + 1, rec, odds_by_fixture.get(rec.candidate.fixture.fixture_id))
+        render_recommendation_card(i + 1, rec, *odds_by_fixture[rec.candidate.fixture.fixture_id])
         for i, rec in enumerate(recommendations)
     ]
     return [header] + cards + [DISCLAIMER]
