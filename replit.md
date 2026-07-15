@@ -44,3 +44,4 @@ python bot.py
 ## User preferences
 
 - Keep existing project structure; do not migrate to a different bot library.
+- Never issue a real request to The Odds API (or any real network call against ODDS_API_KEY) for the agent's own testing/verification without the user's explicit, per-instance permission. All verification must use mock data or the existing persisted cache/archive.

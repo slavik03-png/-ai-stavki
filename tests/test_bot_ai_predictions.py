@@ -52,6 +52,7 @@ def make_update():
 def fake_result(
     messages=None, found=5, analysed=3, recs=1,
     used=6, remaining=80, used_today=20, odds_status="quota_exhausted", errors=None,
+    odds_api_sports_queried=0, odds_api_credits_remaining=None, odds_api_last_request_at=None,
 ):
     return FootballPipelineResult(
         telegram_messages=messages or ["🤖 Прогноз готов"],
@@ -59,6 +60,9 @@ def fake_result(
         api_football_requests_used=used, api_football_requests_remaining=remaining,
         api_football_requests_used_today=used_today,
         odds_status=odds_status, saved_count=recs, duplicate_count=0, errors=errors or [],
+        odds_api_sports_queried=odds_api_sports_queried,
+        odds_api_credits_remaining=odds_api_credits_remaining,
+        odds_api_last_request_at=odds_api_last_request_at,
     )
 
 
@@ -136,10 +140,14 @@ async def main():
     bot._open_football_cache = fresh_cache_factory()
     bot.ai_predictions_cache = None
     bot.ai_predictions_last_diagnostics = None
+    import datetime as _dt
+    fake_odds_request_at = _dt.datetime.now(_dt.timezone.utc).isoformat()
     bot.run_football_predictions = lambda *a, **kw: fake_result(
         messages=["🤖 Прогноз готов"], found=5, analysed=3, recs=1,
         used=6, remaining=80, odds_status="quota_exhausted",
         errors=["ODDS_API_QUOTA_EXHAUSTED: квота The Odds API исчерпана"],
+        odds_api_sports_queried=42, odds_api_credits_remaining="0",
+        odds_api_last_request_at=fake_odds_request_at,
     )
     update, query = make_callback_update(bot.AI_PREDICTIONS_PREFIX)
     await bot.handle_callback(update, ctx)
@@ -151,13 +159,22 @@ async def main():
     # persisted archive + quota counters ---------------------------------
     status_text = bot.build_status_text()
     check("status text exposes saved match/recommendation counts",
-          "Сохранено матчей: 5" in status_text and "Сохранено рекомендаций: 1" in status_text, status_text)
+          "Найдено матчей (API-Football): 5" in status_text and "Сохранено рекомендаций: 1" in status_text, status_text)
     check("status text exposes the Odds API tri-state", "квота исчерпана" in status_text)
     check("status text exposes last successful archive update", "Последнее успешное обновление:" in status_text)
     check("status text exposes API-Football key presence", "API-Football key:" in status_text)
     check("status text exposes archive age field", "Возраст архива:" in status_text)
     check("status text exposes requests-used-today field", "Использовано запросов к API-Football сегодня:" in status_text)
     check("status text never mentions live fixture discovery fields", "Найдено матчей в ближайшие 36 часов" not in status_text)
+    check("status text exposes Odds API sports queried this run",
+          "Обращений при последнем обновлении архива: 42" in status_text, status_text)
+    check("status text exposes Odds API credits remaining",
+          "Осталось кредитов (по последнему ответу API): 0" in status_text, status_text)
+    check("status text exposes Odds API last request time (not raw UTC/ISO)",
+          "Время последнего обращения: сегодня в" in status_text
+          and fake_odds_request_at not in status_text, status_text)
+    check("status text exposes response-source field for Odds API section",
+          "Источник текущих коэффициентов: новый запрос" in status_text, status_text)
 
     # -- admin-only /refresh_data ------------------------------------------
     bot.ADMIN_TELEGRAM_IDS = {999}

@@ -508,6 +508,9 @@ async def handle_ai_predictions(query, *, force_refresh: bool = False) -> None:
                     "api_football_requests_remaining": result.api_football_requests_remaining,
                     "api_football_requests_used_today": result.api_football_requests_used_today,
                     "odds_status": result.odds_status,
+                    "odds_api_sports_queried": result.odds_api_sports_queried,
+                    "odds_api_credits_remaining": result.odds_api_credits_remaining,
+                    "odds_api_last_request_at": result.odds_api_last_request_at,
                     "errors": result.errors,
                     "source": "новый запрос",
                 }
@@ -595,12 +598,27 @@ def build_status_text() -> str:
         recs_text = str(d.get("recommendations_count", "неизвестно"))
         excluded_no_odds_text = str(d.get("excluded_no_real_odds_count", 0))
         source_text = d.get("source", "неизвестно")
+        odds_api_sports_queried_text = str(d.get("odds_api_sports_queried", 0))
+        odds_api_credits_remaining_text = d.get("odds_api_credits_remaining") or "неизвестно"
+        odds_api_last_request_raw = d.get("odds_api_last_request_at")
+        if odds_api_last_request_raw:
+            try:
+                odds_api_last_request_text = format_user_time(
+                    datetime.fromisoformat(odds_api_last_request_raw), now_dt,
+                )
+            except ValueError:
+                odds_api_last_request_text = "неизвестно"
+        else:
+            odds_api_last_request_text = "запросов ещё не было (архив не обновлялся с ключом The Odds API)"
     else:
         archive_age_text = "нет данных (архив ещё не сформирован)"
         last_update_text = "ещё не было успешных обновлений"
         archive_state_text = "отсутствует"
         found_text = matched_text = unmatched_text = fully_stat_text = recs_text = excluded_no_odds_text = "0"
         source_text = "нет данных"
+        odds_api_sports_queried_text = "0"
+        odds_api_credits_remaining_text = "неизвестно"
+        odds_api_last_request_text = "запросов ещё не было"
 
     lines = [
         "ℹ️ Статус AI Ставки",
@@ -620,7 +638,13 @@ def build_status_text() -> str:
         f"Сохранено рекомендаций: {recs_text}",
         f"Исключено (нет реального коэффициента ни у одного букмекера): {excluded_no_odds_text}",
         f"Источник последнего ответа пользователю: {source_text}",
-        f"The Odds API: {_odds_api_status_text()}",
+        "",
+        "The Odds API (защита лимита — один запрос в сутки на весь бот):",
+        f"Статус: {_odds_api_status_text()}",
+        f"Обращений при последнем обновлении архива: {odds_api_sports_queried_text}",
+        f"Осталось кредитов (по последнему ответу API): {odds_api_credits_remaining_text}",
+        f"Время последнего обращения: {odds_api_last_request_text}",
+        f"Источник текущих коэффициентов: {source_text}",
         "",
         "Кэш линии (хранится 30 минут):",
         cache_status_lines(),

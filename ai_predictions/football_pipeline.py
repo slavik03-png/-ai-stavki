@@ -107,6 +107,16 @@ class FootballPipelineResult:
     api_football_requests_remaining: int = 0
     api_football_requests_used_today: int = 0
     odds_status: str = "unavailable"  # available | quota_exhausted | unavailable
+    #: Diagnostics for the Odds API quota-protection requirements (see
+    #: .agents/memory/odds-api-quota-protection.md): how many real
+    #: sport-competition calls were made to The Odds API during THIS run
+    #: (0 when the archive was reused / no key configured), the
+    #: x-requests-remaining credits header from the last real call, and
+    #: the UTC timestamp of that call -- surfaced verbatim in /status so
+    #: an admin can see exactly when quota was last spent, never guessed.
+    odds_api_sports_queried: int = 0
+    odds_api_credits_remaining: Optional[str] = None
+    odds_api_last_request_at: Optional[str] = None
     fixture_discovery: Optional[FixtureDiscoveryResult] = None
     recommendations: List[RankedRecommendation] = field(default_factory=list)
     odds_by_fixture: Dict[int, float] = field(default_factory=dict)
@@ -219,6 +229,9 @@ def save_daily_archive(football_cache: FootballCache, result: "FootballPipelineR
         "api_football_requests_remaining": result.api_football_requests_remaining,
         "api_football_requests_used_today": result.api_football_requests_used_today,
         "odds_status": result.odds_status,
+        "odds_api_sports_queried": result.odds_api_sports_queried,
+        "odds_api_credits_remaining": result.odds_api_credits_remaining,
+        "odds_api_last_request_at": result.odds_api_last_request_at,
         "errors": result.errors,
         "source": "новый запрос",
     }
@@ -337,6 +350,13 @@ def run_football_predictions(
             odds_fetch = fetch_all_active_football_events(api_key=odds_api_key, persistent_cache=football_cache)
             odds_fetch_errors = odds_fetch.errors
             odds_events = odds_fetch.events
+            # This call is the ONLY place the whole pipeline spends real
+            # Odds API quota (see module docstring + odds-first gating
+            # memory) -- record exactly how much was spent and when, so
+            # /status can show real numbers instead of a vague tri-state.
+            result.odds_api_sports_queried = len(odds_fetch.sports_queried)
+            result.odds_api_credits_remaining = odds_fetch.credits_remaining
+            result.odds_api_last_request_at = now.isoformat()
         except Exception as exc:  # never let odds discovery crash the run
             odds_fetch_errors = [str(exc)]
             odds_events = []
