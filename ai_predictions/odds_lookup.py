@@ -49,7 +49,7 @@ def _quota_exhausted(errors: List[str]) -> bool:
     return any("ODDS_API_QUOTA_EXHAUSTED" in e or "401" in e for e in errors)
 
 
-def _best_price_for_market(
+def best_price_for_market(
     event: Dict[str, Any], fixture: Fixture, market_key: str,
 ) -> Optional[Tuple[float, str]]:
     """Returns (best_price, bookmaker_title) for the requested market, or
@@ -112,6 +112,33 @@ def _best_price_for_market(
     return best, best_bookmaker
 
 
+def attach_prices_from_matches(
+    matches: List[FixtureMatch],
+    fixture_market_keys: Dict[int, str],
+) -> OddsLookupResult:
+    """Extracts a real bookmaker price for each already-matched
+    (fixture, event) pair, for whichever single market that fixture's
+    recommendation needs (`fixture_market_keys`). Does no fetching or
+    matching itself -- callers that already ran
+    `ai_predictions.fixture_matching.match_fixtures_to_events` (e.g. the
+    odds-first pipeline in football_pipeline.py, which matches once and
+    reuses the result both to decide what to analyse and to price the
+    final picks) should call this directly instead of `lookup_coefficients`
+    to avoid a redundant fetch+match pass."""
+    prices: Dict[int, float] = {}
+    bookmakers: Dict[int, str] = {}
+    for match in matches:
+        market_key = fixture_market_keys.get(match.fixture.fixture_id)
+        if not market_key:
+            continue
+        found = best_price_for_market(match.event, match.fixture, market_key)
+        if found is not None:
+            price, bookmaker_title = found
+            prices[match.fixture.fixture_id] = price
+            bookmakers[match.fixture.fixture_id] = bookmaker_title
+    return OddsLookupResult(prices_by_fixture=prices, bookmaker_by_fixture=bookmakers, status="available")
+
+
 def lookup_coefficients(
     fixtures: List[Fixture],
     fixture_market_keys: Dict[int, str],
@@ -119,7 +146,14 @@ def lookup_coefficients(
     odds_api_key: Optional[str],
     persistent_cache: Optional[Any] = None,
 ) -> OddsLookupResult:
-    """`fixture_market_keys` maps fixture_id -> the single market_key this
+    """Convenience wrapper that fetches real Odds API events and matches
+    them to `fixtures` itself, then reuses `attach_prices_from_matches`.
+    Kept for callers/tests that want the whole fetch+match+price flow in
+    one call; the production pipeline instead fetches/matches once up
+    front (to gate which fixtures are worth analysing at all) and calls
+    `attach_prices_from_matches` directly on that same match result.
+
+    `fixture_market_keys` maps fixture_id -> the single market_key this
     fixture's recommendation needs a price for. Returns a best-effort
     price map; a fixture absent from the returned map simply has no
     coefficient available -- never an error the caller has to handle."""
@@ -140,16 +174,4 @@ def lookup_coefficients(
         return OddsLookupResult(prices_by_fixture={}, status=status, detail="; ".join(fetch_result.errors[:1]) or None)
 
     match_result = match_fixtures_to_events(fixtures, fetch_result.events)
-    prices: Dict[int, float] = {}
-    bookmakers: Dict[int, str] = {}
-    for match in match_result.matches:
-        market_key = fixture_market_keys.get(match.fixture.fixture_id)
-        if not market_key:
-            continue
-        found = _best_price_for_market(match.event, match.fixture, market_key)
-        if found is not None:
-            price, bookmaker_title = found
-            prices[match.fixture.fixture_id] = price
-            bookmakers[match.fixture.fixture_id] = bookmaker_title
-
-    return OddsLookupResult(prices_by_fixture=prices, bookmaker_by_fixture=bookmakers, status="available")
+    return attach_prices_from_matches(match_result.matches, fixture_market_keys)

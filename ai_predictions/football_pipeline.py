@@ -1,19 +1,36 @@
 """
-Production v3 orchestration: API-Football is the PRIMARY and SUFFICIENT
-data source for the "🤖 Прогнозы ИИ" recommendations. The Odds API is
-purely optional coefficient enrichment layered on afterwards -- see
-module docstrings on ai_predictions/football_predictions.py and
-ai_predictions/odds_lookup.py for the exact non-blocking contract.
+Production v4 orchestration (odds-first, 2026-07-15 rearchitecture):
+real, currently-quoted Odds API bookmaker coverage now GATES which real
+API-Football fixtures are worth analysing at all, instead of being an
+afterthought that dropped good candidates once no bookmaker covered them.
 
 Pipeline:
-  discover real fixtures in the strict 36h window (API-Football only,
-  6h-cached) -> analyse up to MAX_FIXTURES_ANALYSED_PER_RUN of them
-  (soonest kickoff first) purely from API-Football data -> pick the
-  single best real market per fixture, classify HIGH/MEDIUM/LOW/omit
-  by the probability+completeness thresholds, keep up to 5 -> best-
-  effort attach a real Odds API coefficient to each kept recommendation
-  (never blocking) -> persist every kept recommendation to tracking ->
-  render the exact Russian card format.
+  discover real fixtures in the strict 36h window (API-Football, 6h-
+  cached) -> fetch every currently active real Odds API event once
+  (dynamic sport discovery, ai_predictions/odds_client.py) -> match real
+  fixtures to real events by team-name + kickoff-time confidence
+  (ai_predictions/fixture_matching.py) -> analyse ONLY the matched
+  fixtures (up to MAX_FIXTURES_ANALYSED_PER_RUN, soonest kickoff first)
+  from API-Football data (statistics/predictions model, never the odds
+  themselves) -> pick the single best real market per fixture, classify
+  HIGH/MEDIUM/LOW/omit by the probability+completeness thresholds, keep
+  up to 5 -> attach the real bookmaker price for each kept
+  recommendation's chosen market from the SAME match result (no second
+  fetch) -> persist every kept recommendation to tracking -> render the
+  exact Russian card format.
+
+Why: analysing a fixture no real bookmaker currently quotes always ended
+in that candidate being dropped at the very end anyway, wasting
+API-Football budget on matches that could never be shown -- and worse,
+capping analysis at MAX_FIXTURES_ANALYSED_PER_RUN fixtures picked by
+soonest-kickoff-with-no-odds-awareness could exhaust that cap before
+ever reaching a fixture that DID have real odds. Gating by real odds
+coverage FIRST guarantees every fixture that reaches analysis can
+actually become a real, prosentable recommendation, which is what makes
+a daily minimum of a few real-odds recommendations achievable.
+
+See .agents/memory/odds-first-fixture-gating.md for the design rationale
+and how this supersedes the older API-Football-primary rule.
 """
 
 from __future__ import annotations
@@ -24,10 +41,12 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from ai_predictions.fixture_matching import FixtureMatch, match_fixtures_to_events
 from ai_predictions.fixtures import FixtureDiscoveryResult, discover_fixtures_in_window
 from ai_predictions.football_cache import FootballCache
 from ai_predictions.football_predictions import MarketCandidate, build_candidates_for_fixture
-from ai_predictions.odds_lookup import OddsLookupResult, lookup_coefficients
+from ai_predictions.odds_client import QUOTA_EXHAUSTED_MARKER, fetch_all_active_football_events
+from ai_predictions.odds_lookup import OddsLookupResult, attach_prices_from_matches
 from ai_predictions.prediction_report import render_predictions_message
 from ai_predictions.prediction_selector import RankedRecommendation, select_recommendations
 from ai_predictions.value_config import (
@@ -73,6 +92,14 @@ DAILY_ARCHIVE_LOCK_KEY = "daily_archive:refresh_in_progress"
 class FootballPipelineResult:
     telegram_messages: List[str] = field(default_factory=list)
     found_fixtures: int = 0
+    #: Discovered fixtures for which a real, currently-quoted Odds API
+    #: event was confidently matched (see fixture_matching.py) -- this is
+    #: the odds-first gate: only these are ever passed to analysis.
+    matched_fixtures: int = 0
+    #: Discovered fixtures with no real odds event matched at all (either
+    #: no plausible event, or more than one equally plausible candidate --
+    #: never guessed, always excluded honestly).
+    unmatched_fixtures_no_odds: int = 0
     analysed_fixtures: int = 0
     fully_stat_fixtures: int = 0
     recommendations_count: int = 0
@@ -85,9 +112,11 @@ class FootballPipelineResult:
     odds_by_fixture: Dict[int, float] = field(default_factory=dict)
     bookmaker_by_fixture: Dict[int, str] = field(default_factory=dict)
     #: Candidates that cleared the probability threshold but were dropped
-    #: because no real bookmaker actually quotes that event+market right
-    #: now -- never shown, saved or recorded (see the real-odds gate in
-    #: run_football_predictions).
+    #: because the real, already-matched bookmaker event does not actually
+    #: quote that exact market/outcome right now -- never shown, saved or
+    #: recorded (see the real-odds gate in run_football_predictions). Rare
+    #: under the odds-first architecture since the fixture itself is only
+    #: analysed because a real event was already matched to it.
     excluded_no_real_odds_count: int = 0
     saved_count: int = 0
     duplicate_count: int = 0
@@ -180,9 +209,12 @@ def load_daily_archive(
 def save_daily_archive(football_cache: FootballCache, result: "FootballPipelineResult", now: datetime.datetime) -> None:
     diagnostics = {
         "found_fixtures": result.found_fixtures,
+        "matched_fixtures": result.matched_fixtures,
+        "unmatched_fixtures_no_odds": result.unmatched_fixtures_no_odds,
         "analysed_fixtures": result.analysed_fixtures,
         "fully_stat_fixtures": result.fully_stat_fixtures,
         "recommendations_count": result.recommendations_count,
+        "excluded_no_real_odds_count": result.excluded_no_real_odds_count,
         "api_football_requests_used": result.api_football_requests_used,
         "api_football_requests_remaining": result.api_football_requests_remaining,
         "api_football_requests_used_today": result.api_football_requests_used_today,
@@ -283,23 +315,66 @@ def run_football_predictions(
     result.found_fixtures = len(fixture_discovery.fixtures)
     result.errors.extend(fixture_discovery.errors)
 
+    # --- Odds-first gate: fetch every real, currently active Odds API
+    # event ONCE, and match it to the real discovered fixtures ONCE. Only
+    # fixtures with a confident match are ever worth spending API-Football
+    # budget analysing -- see module docstring. The exact same match
+    # result is reused at the very end to price the final picks, so this
+    # is the only Odds API fetch for the whole run.
+    if not odds_api_key:
+        # Deliberately short-circuits BEFORE calling fetch_all_active_football_events:
+        # that function (and discover_football_sport_keys underneath it)
+        # falls back to os.getenv("ODDS_API_KEY") for a falsy api_key, which
+        # would silently use the real environment secret even when a caller
+        # explicitly passed no key (e.g. a test simulating "no key
+        # configured"). An explicit empty/None odds_api_key must mean
+        # "definitely no odds", never "fall back to whatever's in the
+        # environment".
+        odds_fetch_errors = ["Не найден ODDS_API_KEY"]
+        odds_events = []
+    else:
+        try:
+            odds_fetch = fetch_all_active_football_events(api_key=odds_api_key, persistent_cache=football_cache)
+            odds_fetch_errors = odds_fetch.errors
+            odds_events = odds_fetch.events
+        except Exception as exc:  # never let odds discovery crash the run
+            odds_fetch_errors = [str(exc)]
+            odds_events = []
+
+    if any(QUOTA_EXHAUSTED_MARKER in e for e in odds_fetch_errors):
+        result.odds_status = "quota_exhausted"
+    elif not odds_api_key or (odds_fetch_errors and not odds_events):
+        result.odds_status = "unavailable"
+    else:
+        result.odds_status = "available"
+
+    match_result = match_fixtures_to_events(fixture_discovery.fixtures, odds_events)
+    result.matched_fixtures = len(match_result.matches)
+    result.unmatched_fixtures_no_odds = len(match_result.unmatched_fixtures) + len(match_result.ambiguous_fixtures)
+
+    # Soonest kickoff first among the matched pool only -- unmatched
+    # fixtures (no real bookmaker coverage right now) are never analysed
+    # at all, so the analysis cap can never be exhausted by fixtures that
+    # could never become a real recommendation anyway.
+    fixtures_with_real_odds = sorted((m.fixture for m in match_result.matches), key=lambda f: f.kickoff_utc)
+
     from football.providers.api_football import ApiFootballProvider
     provider = ApiFootballProvider(api_key=football_api_key, now=now)
 
-    # Every fixture up to max_fixtures_analysed is always analysed --
-    # build_candidates_for_fixture never needs to be skipped wholesale:
-    # it reads persistent cache first, only spends real requests while
-    # football_cache.can_spend(1) allows it (per real HTTP call, not per
-    # fixture), and falls back to a historical-baseline signal when
-    # nothing real is available at all. This guarantees analysed_fixtures
-    # is never 0 while found_fixtures > 0 -- the daily quota reserve can
-    # only reduce *how much real data* backs each candidate, never how
-    # many fixtures get ranked.
+    # Every matched fixture up to max_fixtures_analysed is always
+    # analysed -- build_candidates_for_fixture never needs to be skipped
+    # wholesale: it reads persistent cache first, only spends real
+    # requests while football_cache.can_spend(1) allows it (per real HTTP
+    # call, not per fixture), and falls back to a historical-baseline
+    # signal when nothing real is available at all. This guarantees
+    # analysed_fixtures is never 0 while matched_fixtures > 0 -- the
+    # daily quota reserve can only reduce *how much real data* backs each
+    # candidate, never how many matched fixtures get ranked.
     all_candidates: List[MarketCandidate] = []
     analysed = 0
     fully_stat_fixture_ids: set = set()
     quota_exhausted_during_run = False
-    for fixture in fixture_discovery.fixtures[:max_fixtures_analysed]:
+    for fixture in fixtures_with_real_odds[:max_fixtures_analysed]:
         if not football_cache.can_spend(1):
             quota_exhausted_during_run = True
         candidates, _ = build_candidates_for_fixture(fixture, provider, football_cache)
@@ -326,12 +401,10 @@ def run_football_predictions(
     fixture_market_keys = {
         rec.candidate.fixture.fixture_id: rec.candidate.market_key for rec in candidate_recommendations
     }
-    fixtures_for_lookup = [rec.candidate.fixture for rec in candidate_recommendations]
     try:
-        odds_result = lookup_coefficients(fixtures_for_lookup, fixture_market_keys, odds_api_key=odds_api_key)
-    except Exception as exc:  # never let optional enrichment break the run
+        odds_result = attach_prices_from_matches(match_result.matches, fixture_market_keys)
+    except Exception as exc:  # never let price attachment break the run
         odds_result = OddsLookupResult(prices_by_fixture={}, status="unavailable", detail=str(exc))
-    result.odds_status = odds_result.status
     result.odds_by_fixture = odds_result.prices_by_fixture
     result.bookmaker_by_fixture = odds_result.bookmaker_by_fixture
 
@@ -364,6 +437,7 @@ def run_football_predictions(
         ranked, odds_and_bookmaker_by_fixture,
         found_fixtures=result.found_fixtures, analysed_fixtures=result.analysed_fixtures,
         candidates_without_odds=result.excluded_no_real_odds_count,
+        matched_fixtures=result.matched_fixtures,
     )
 
     archive_version = now.date().isoformat()

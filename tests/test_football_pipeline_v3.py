@@ -33,7 +33,6 @@ from ai_predictions.prediction_selector import select_recommendations
 from ai_predictions.prediction_report import (
     render_predictions_message, render_no_signal_message, render_recommendation_card, HEADING,
 )
-from ai_predictions.odds_lookup import lookup_coefficients, OddsLookupResult
 import ai_predictions.football_pipeline as football_pipeline_mod
 from ai_predictions.football_pipeline import run_football_predictions
 from tracking.storage import TrackingStorage
@@ -206,7 +205,12 @@ def test_reserve_exhausted_still_analyses_every_fixture_from_cache():
 # quota-exhausted/401 never blocks recommendations.
 # ---------------------------------------------------------------------------
 
-def test_pipeline_produces_recommendations_with_zero_odds_quota():
+def test_pipeline_finds_nothing_to_analyse_with_zero_odds_quota():
+    """Odds-first architecture (2026-07-15): if The Odds API has no real
+    events at all (quota exhausted / no key), no fixture is ever matched,
+    so nothing is analysed -- this must not crash and must produce an
+    honest, distinct message, never a placeholder coefficient and never
+    the generic 'probability too low' message."""
     fixtures = [_fixture(10, "Home A", "Away A", hours_ahead=3)]
 
     def fake_discover(api_key, cache, now, window_hours=36, **kwargs):
@@ -226,38 +230,30 @@ def test_pipeline_produces_recommendations_with_zero_odds_quota():
                 },
             )
 
-    def fake_lookup(fixtures, market_map, *, odds_api_key, persistent_cache=None):
-        # Simulates The Odds API HTTP 401 / exhausted quota -- must not
-        # raise and must not block fixture discovery/analysis, but per the
-        # mandatory real-odds gate, a candidate with no real price must
-        # still be dropped rather than shown.
-        return OddsLookupResult(prices_by_fixture={}, bookmaker_by_fixture={}, status="quota_exhausted", detail="HTTP 401")
-
     import football.providers.api_football as api_football_mod
     orig_discover = football_pipeline_mod.discover_fixtures_in_window
     orig_provider_cls = api_football_mod.ApiFootballProvider
-    orig_lookup = football_pipeline_mod.lookup_coefficients
     football_pipeline_mod.discover_fixtures_in_window = fake_discover
     api_football_mod.ApiFootballProvider = FakeProviderModule.ApiFootballProvider
-    football_pipeline_mod.lookup_coefficients = fake_lookup
     try:
         storage = TrackingStorage(db_path=tempfile.mktemp())
         cache = FootballCache(db_path=tempfile.mktemp(), now=NOW)
+        # No ODDS_API_KEY given -> fetch_all_active_football_events returns
+        # zero events -> zero matches -> zero fixtures analysed, honestly.
         result = run_football_predictions(
             football_api_key="real-key", odds_api_key="", storage=storage, now=NOW, football_cache=cache,
         )
         cache.close()
 
         check("fixtures found via API-Football alone", result.found_fixtures == 1)
+        check("no fixture matched to a real odds event", result.matched_fixtures == 0)
+        check("the unmatched fixture is counted, not silently dropped", result.unmatched_fixtures_no_odds == 1)
+        check("nothing was analysed -- no real odds coverage means no point spending API-Football budget",
+              result.analysed_fixtures == 0)
         check("no coefficient attached", result.odds_by_fixture == {})
-        check(
-            "recommendation dropped entirely when no real coefficient is found "
-            "(never shown without a real, matched bookmaker price)",
-            result.recommendations_count == 0,
-        )
-        check("dropped candidate is counted as excluded for no real odds", result.excluded_no_real_odds_count >= 1)
-        check("odds_status reflects quota exhaustion, doesn't crash the run", result.odds_status == "quota_exhausted")
-        check("telegram message honestly explains no real coefficient was found, never a placeholder",
+        check("no recommendation produced", result.recommendations_count == 0)
+        check("odds_status reflects unavailability, doesn't crash the run", result.odds_status == "unavailable")
+        check("telegram message honestly explains no real odds coverage exists for any found match",
               any("реальн" in m and "коэффициент" in m for m in result.telegram_messages))
         check("no 'нет данных' placeholder is ever shown",
               not any("нет данных" in m for m in result.telegram_messages))
@@ -265,7 +261,89 @@ def test_pipeline_produces_recommendations_with_zero_odds_quota():
     finally:
         football_pipeline_mod.discover_fixtures_in_window = orig_discover
         api_football_mod.ApiFootballProvider = orig_provider_cls
-        football_pipeline_mod.lookup_coefficients = orig_lookup
+
+
+def test_pipeline_only_analyses_fixtures_with_real_matched_odds():
+    """Core odds-first behaviour: two fixtures are discovered, but only
+    one has a real, matched Odds API event -- only that one is analysed
+    and can become a recommendation; the other is never even touched."""
+    matched_fixture = _fixture(11, "Home M", "Away M", hours_ahead=4)
+    unmatched_fixture = _fixture(12, "Home U", "Away U", hours_ahead=6)
+    fixtures = [matched_fixture, unmatched_fixture]
+
+    def fake_discover(api_key, cache, now, window_hours=36, **kwargs):
+        from ai_predictions.fixtures import FixtureDiscoveryResult
+        return FixtureDiscoveryResult(fixtures=fixtures, dates_queried=["2026-07-14"], requests_used=1)
+
+    event = {
+        "id": "evt1", "home_team": "Home M", "away_team": "Away M",
+        "commence_time": matched_fixture.kickoff_utc.isoformat(),
+        "bookmakers": [{
+            "title": "Pinnacle",
+            "markets": [
+                {"key": "h2h", "outcomes": [
+                    {"name": "Home M", "price": 1.9}, {"name": "Draw", "price": 3.4}, {"name": "Away M", "price": 4.1},
+                ]},
+                {"key": "totals", "outcomes": [
+                    {"name": "Over", "point": 1.5, "price": 1.5}, {"name": "Under", "point": 1.5, "price": 2.6},
+                    {"name": "Over", "point": 2.5, "price": 2.1}, {"name": "Under", "point": 2.5, "price": 1.75},
+                    {"name": "Over", "point": 3.5, "price": 3.3}, {"name": "Under", "point": 3.5, "price": 1.3},
+                ]},
+                {"key": "btts", "outcomes": [{"name": "Yes", "price": 1.8}, {"name": "No", "price": 2.0}]},
+            ],
+        }],
+    }
+
+    def fake_fetch_events(api_key=None, persistent_cache=None):
+        from ai_predictions.odds_client import MultiSportFetchResult
+        return MultiSportFetchResult(events=[event])
+
+    class FakeProviderModule:
+        @staticmethod
+        def ApiFootballProvider(api_key=None, now=None):
+            return FakeProvider(
+                predictions_by_fixture={
+                    11: Stat.ok({"percent": {"home": "78%", "draw": "12%", "away": "10%"},
+                                 "advice": None, "under_over": None, "goals": {},
+                                 "win_or_draw": None, "winner_comment": None, "comparison": {}}),
+                },
+                last_matches_by_team={
+                    "Home M": _team_matches("Home M", "X", 2, 0),
+                    "Away M": _team_matches("Away M", "Y", 0, 2),
+                },
+            )
+
+    import football.providers.api_football as api_football_mod
+    orig_discover = football_pipeline_mod.discover_fixtures_in_window
+    orig_provider_cls = api_football_mod.ApiFootballProvider
+    orig_fetch = football_pipeline_mod.fetch_all_active_football_events
+    football_pipeline_mod.discover_fixtures_in_window = fake_discover
+    api_football_mod.ApiFootballProvider = FakeProviderModule.ApiFootballProvider
+    football_pipeline_mod.fetch_all_active_football_events = fake_fetch_events
+    try:
+        storage = TrackingStorage(db_path=tempfile.mktemp())
+        cache = FootballCache(db_path=tempfile.mktemp(), now=NOW)
+        result = run_football_predictions(
+            football_api_key="real-key", odds_api_key="real-odds-key", storage=storage, now=NOW, football_cache=cache,
+        )
+        cache.close()
+
+        check("both discovered fixtures counted", result.found_fixtures == 2)
+        check("exactly one fixture matched to a real odds event", result.matched_fixtures == 1)
+        check("the other fixture is counted as unmatched, not silently dropped", result.unmatched_fixtures_no_odds == 1)
+        check("only the matched fixture was analysed (unmatched one never touched)", result.analysed_fixtures == 1)
+        check("the matched fixture's real bookmaker price made it through",
+              matched_fixture.fixture_id in result.odds_by_fixture)
+        check("the real bookmaker name is attached", result.bookmaker_by_fixture.get(matched_fixture.fixture_id) == "Pinnacle")
+        check("a real recommendation was produced for the matched fixture only",
+              result.recommendations_count >= 1 and all(
+                  r.candidate.fixture.fixture_id == matched_fixture.fixture_id for r in result.recommendations
+              ))
+        storage.close()
+    finally:
+        football_pipeline_mod.discover_fixtures_in_window = orig_discover
+        api_football_mod.ApiFootballProvider = orig_provider_cls
+        football_pipeline_mod.fetch_all_active_football_events = orig_fetch
 
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,14 @@
 ---
 name: API-Football-primary production architecture (v3)
-description: Why and how the Telegram bot's recommendations were rearchitected so The Odds API can never gate or reduce them.
+description: Why and how the Telegram bot's recommendations were rearchitected so The Odds API can never gate or reduce them. SUPERSEDED 2026-07-15 for the "Odds API must never gate candidate creation" rule specifically — see below.
 ---
+
+> **Superseded 2026-07-15**: the "Odds API must never gate candidate creation" rule below (the
+> section right after this note) was deliberately reversed by explicit user request — see
+> [odds-first-fixture-gating.md](odds-first-fixture-gating.md) for the current architecture and why
+> both rules are legitimate depending on the product goal. The rest of this file (quota-reserve
+> gating per-HTTP-call, per-item cache TTL vs. final-result cache, daily quota reserve vs. hard cap)
+> is unrelated implementation guidance and still applies as-is.
 
 As of 2026-07-14, the bot's live "🤖 Прогнозы ИИ" recommendations run on
 `ai_predictions/football_pipeline.py`, NOT the older fixture-discovery

@@ -498,6 +498,8 @@ async def handle_ai_predictions(query, *, force_refresh: bool = False) -> None:
                 # never sent here.
                 ai_predictions_last_diagnostics = {
                     "found_fixtures": result.found_fixtures,
+                    "matched_fixtures": result.matched_fixtures,
+                    "unmatched_fixtures_no_odds": result.unmatched_fixtures_no_odds,
                     "analysed_fixtures": result.analysed_fixtures,
                     "fully_stat_fixtures": result.fully_stat_fixtures,
                     "recommendations_count": result.recommendations_count,
@@ -587,6 +589,8 @@ def build_status_text() -> str:
             archive_state_text = "устарел (>24ч), будет обновлён при следующем запросе"
         d = archive.diagnostics
         found_text = str(d.get("found_fixtures", "неизвестно"))
+        matched_text = str(d.get("matched_fixtures", "неизвестно"))
+        unmatched_text = str(d.get("unmatched_fixtures_no_odds", "неизвестно"))
         fully_stat_text = str(d.get("fully_stat_fixtures", "неизвестно"))
         recs_text = str(d.get("recommendations_count", "неизвестно"))
         excluded_no_odds_text = str(d.get("excluded_no_real_odds_count", 0))
@@ -595,7 +599,7 @@ def build_status_text() -> str:
         archive_age_text = "нет данных (архив ещё не сформирован)"
         last_update_text = "ещё не было успешных обновлений"
         archive_state_text = "отсутствует"
-        found_text = fully_stat_text = recs_text = excluded_no_odds_text = "0"
+        found_text = matched_text = unmatched_text = fully_stat_text = recs_text = excluded_no_odds_text = "0"
         source_text = "нет данных"
 
     lines = [
@@ -609,7 +613,9 @@ def build_status_text() -> str:
         "Суточный архив прогнозов:",
         f"Последнее успешное обновление: {last_update_text}",
         f"Возраст архива: {archive_age_text} ({archive_state_text})",
-        f"Сохранено матчей: {found_text}",
+        f"Найдено матчей (API-Football): {found_text}",
+        f"Из них с реальными коэффициентами (The Odds API): {matched_text}",
+        f"Без реальных коэффициентов, не анализировались: {unmatched_text}",
         f"Матчей с полной статистикой: {fully_stat_text}",
         f"Сохранено рекомендаций: {recs_text}",
         f"Исключено (нет реального коэффициента ни у одного букмекера): {excluded_no_odds_text}",

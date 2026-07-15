@@ -45,6 +45,17 @@ NO_ODDS_TEMPLATE = (
     "Бот не показывает прогнозы без реального коэффициента."
 )
 
+#: Shown when real fixtures were discovered but NONE of them currently has
+#: a matched, real Odds API event at all -- the odds-first gate (see
+#: football_pipeline.py) never even analyses such fixtures, so this is a
+#: distinct, earlier reason than NO_ODDS_TEMPLATE (which is about a
+#: specific market not being quoted for an already-matched event).
+NO_ODDS_EVENTS_TEMPLATE = (
+    "На ближайшие 36 часов найдено {count} матчей, но ни для одного из них сейчас нет "
+    "реальных коэффициентов у букмекеров The Odds API. Бот анализирует только матчи, "
+    "которые реально есть в линии букмекеров."
+)
+
 HEADING = "🤖 ПРОГНОЗЫ ИИ НА БЛИЖАЙШИЕ 36 ЧАСОВ"
 
 #: Shown once, after all cards, whenever at least one recommendation was
@@ -61,6 +72,10 @@ def render_no_signal_message(found_fixtures: int) -> str:
 
 def render_no_odds_message(candidates_without_odds: int) -> str:
     return NO_ODDS_TEMPLATE.format(count=candidates_without_odds)
+
+
+def render_no_odds_events_message(found_fixtures: int) -> str:
+    return NO_ODDS_EVENTS_TEMPLATE.format(count=found_fixtures)
 
 
 def _format_probability(probability: float) -> str:
@@ -161,6 +176,7 @@ def render_predictions_message(
     found_fixtures: int,
     analysed_fixtures: int,
     candidates_without_odds: int = 0,
+    matched_fixtures: Optional[int] = None,
 ) -> List[str]:
     """Returns one or more Telegram message chunks: a short heading (with
     Found/Analysed/Selected counts), one card per recommendation, and a
@@ -172,15 +188,21 @@ def render_predictions_message(
     no real, matched bookmaker price before calling this function; this
     module never shows a placeholder coefficient.
 
-    If `recommendations` is empty because nothing cleared the probability
-    threshold at all, the exact no-signal message is returned. If
-    `recommendations` is empty specifically because every threshold-passing
-    candidate had no real coefficient in any bookmaker's line
-    (`candidates_without_odds > 0`), a distinct, honest message is shown
-    instead."""
+    Three distinct empty-result reasons, checked in order (odds-first
+    pipeline, football_pipeline.py):
+    1. `candidates_without_odds > 0` -- some candidate cleared the
+       probability threshold but its already-matched event doesn't quote
+       that exact market right now.
+    2. `matched_fixtures == 0` (and fixtures were found) -- no real Odds
+       API event was matched to ANY discovered fixture at all, so nothing
+       was even analysed.
+    3. otherwise -- analysis ran but nothing cleared the probability
+       threshold (the classic no-signal case)."""
     if not recommendations:
         if candidates_without_odds > 0:
             return [render_no_odds_message(candidates_without_odds)]
+        if matched_fixtures == 0 and found_fixtures > 0:
+            return [render_no_odds_events_message(found_fixtures)]
         return [render_no_signal_message(found_fixtures)]
 
     header = (
