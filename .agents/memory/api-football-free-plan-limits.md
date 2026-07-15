@@ -1,33 +1,14 @@
 ---
 name: API-Football free plan limits
-description: Why a configured FOOTBALL_API_KEY can return zero real statistics even though requests succeed with HTTP 200.
+description: What the API-Football free plan actually blocks and how to handle each restriction without surfacing errors to the user.
 ---
 
-The API-Football (v3.football.api-sports.io) free plan tier rejects, inside a 200 response's `errors` field
-(not via HTTP status), two things relevant to any "current match" prediction feature:
-- The `last`/`next` convenience params on `/fixtures` ("Free plans do not have access to the Last/Next parameter").
-- Any season outside 2022-2024 ("Free plans do not have access to this season, try from 2022 to 2024").
+## Restrictions (confirmed against live API)
 
-**Why it matters:** this means a free-tier key can never supply real team-form/H2H/stats data for the current
-season, no matter how the provider code is written — every such call comes back as a legitimate "no data",
-not a bug. Do not spend time "fixing" candidate-builder or selection-engine logic before checking the raw
-`/fixtures` response `errors` field for this plan message.
+1. **`last` / `next` fixture params** — only work for seasons within `API_FOOTBALL_FREE_PLAN_SEASONS = {2022, 2023, 2024}`. Since July 2026, `_season_for(now)` returns 2026, which is out of range. Fix: always send `season=min(self.season, FREE_PLAN_MAX_SEASON)` in `_fetch_fixtures` — this constrains team-history lookups to the most recent allowed season (2024) instead of crashing.
 
-**How to apply:** if a football-stats-dependent feature returns systematically empty data for real API calls,
-curl `/fixtures?team=<id>&season=<current_year>` directly and read `errors` before assuming a code bug. Fixing
-requires an upgraded API-Football plan (or restructuring around a different real signal, e.g. cross-bookmaker
-price-dispersion value betting instead of team-strength stats) — it is a plan/product decision, not a patch.
+2. **`date` param** — restricted to a 3-day window: [today − 1 day, today + 1 day] UTC. The 36-hour analysis window can include dates 2 days ahead, which the free plan rejects. Fix: in `discover_fixtures_in_window` (fixtures.py), clamp the date list to `max_date = today_utc + timedelta(days=API_FOOTBALL_FREE_PLAN_DATE_AHEAD_DAYS)` BEFORE any network call, so the error "Free plans do not have access to this date" is never reached.
 
-**Correction (2026-07-14): the season restriction does NOT apply to date-based fixture discovery.** Confirmed live:
-`/fixtures?date=YYYY-MM-DD` (used for real fixture discovery — no `season`/`last`/`next` param) returns real
-fixtures on the free plan for the *current* date range with no errors; a live production run discovered 232 real
-fixtures in a 36h window this way. Only `season`/`last`/`next`-based queries hit the restriction above. So: use
-`/fixtures?date=` as the primary source of truth for "what real matches exist right now", and reserve the
-season-gate check above for the team-stats/form endpoints that actually take a `season` param.
+**Why:** Attempting a request the free plan will reject wastes a quota unit AND surfaces a confusing error. Pre-filtering silently skips the date; the fixture-window filter then rejects any fixtures whose kickoff falls outside the analysis window anyway, so nothing real is missed.
 
-**Season-gate design (activated as an *enrichment* on top of odds-only value betting, not a replacement):**
-check the computed season against the allowed set *before* spending any quota; if it's out of range, skip every
-API-Football HTTP call for the whole run (0 requests) and mark affected candidates honestly (e.g.
-`statistics_source="unavailable"`) rather than letting each call fail individually and burn quota discovering the
-same restriction repeatedly. In production today (mid-2026) this means enrichment will report 0 real API-Football
-requests on every run — that is the season gate working correctly, not a broken integration.
+**How to apply:** Any new endpoint that takes a `date`, `season`, `last`, or `next` param: check `API_FOOTBALL_FREE_PLAN_SEASONS` / `API_FOOTBALL_FREE_PLAN_DATE_AHEAD_DAYS` before constructing the request. Both constants live in `ai_predictions/value_config.py`.

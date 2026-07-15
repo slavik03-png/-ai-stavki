@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional, Set
 
 from ai_predictions.football_cache import FootballCache
 from ai_predictions.value_config import (
+    API_FOOTBALL_FREE_PLAN_DATE_AHEAD_DAYS,
     FIXTURE_CANCELLED_STATUSES,
     FIXTURE_FINISHED_STATUSES,
     FIXTURE_LIST_CACHE_TTL_HOURS,
@@ -144,7 +145,17 @@ def discover_fixtures_in_window(
         provider_factory = lambda: ApiFootballProvider(api_key=api_key, now=now)
 
     provider = provider_factory()
-    dates = _window_dates(now, window_hours)
+    all_dates = _window_dates(now, window_hours)
+
+    # API-Football free plan only serves fixture lists for a narrow window
+    # around today: [today - 1 day, today + API_FOOTBALL_FREE_PLAN_DATE_AHEAD_DAYS].
+    # Skip dates outside this range BEFORE making any request so the "Free
+    # plans do not have access to this date" error never surfaces to the
+    # user (requirement: the bot must self-limit to the allowed range).
+    today_utc = now.astimezone(datetime.timezone.utc).date()
+    max_allowed = today_utc + datetime.timedelta(days=API_FOOTBALL_FREE_PLAN_DATE_AHEAD_DAYS)
+    dates = [d for d in all_dates if datetime.date.fromisoformat(d) <= max_allowed]
+
     result.dates_queried = dates
 
     seen_ids: Set[int] = set()

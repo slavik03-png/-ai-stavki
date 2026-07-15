@@ -172,6 +172,13 @@ TEAM_MATCH_CONFIDENCE_FLOOR = 0.72
 #: rather than spending quota on calls already known to fail.
 API_FOOTBALL_FREE_PLAN_SEASONS = frozenset({2022, 2023, 2024})
 
+#: API-Football free plan also restricts the `date` param on the fixtures
+#: endpoint: only the window [today - 1 day, today + 1 day] is served.
+#: Dates beyond this range return "Free plans do not have access to this
+#: date" -- we skip those dates before making any request so the error
+#: never surfaces to the user (per the requirement in the task spec).
+API_FOOTBALL_FREE_PLAN_DATE_AHEAD_DAYS = 1
+
 #: How strongly a real statistics-agreement signal (0..1, 0.5 = neutral)
 #: can nudge a candidate's ranking *within its own HIGH/MEDIUM/LOW tier*.
 #: Never large enough to matter more than the underlying odds edge/EV, and

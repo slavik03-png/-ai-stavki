@@ -45,14 +45,14 @@ from ai_predictions.football_pipeline import (
     save_daily_archive,
 )
 from ai_predictions.prediction_report import render_nothing_left_for_user_message
-from ai_predictions.value_config import DAILY_ARCHIVE_TTL_HOURS, LIVE_CACHE_TTL_MINUTES
+from ai_predictions.value_config import DAILY_ARCHIVE_TTL_HOURS, LIVE_CACHE_TTL_MINUTES, MIN_LEAD_TIME_MINUTES
 from ai_predictions.window import format_user_time, local_date_str
 
 # Live in-play predictions mode (2026-07-15, Task #11): its own, fully
 # independent pipeline/cache -- never shares a cache key, storage call, or
 # code path with the "🤖 Прогнозы ИИ" pipeline above (see
 # tests/test_live_pipeline_isolation.py).
-from ai_predictions.live_pipeline import cache_age_seconds, run_live_predictions_cached
+from ai_predictions.live_pipeline import cache_age_seconds, load_cached_live_result, run_live_predictions_cached
 
 # The AI Betting Analytics module (analytics/) is a new, independent
 # top-level package -- like ai_predictions/, it is fine for bot.py to
@@ -369,8 +369,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/status -- same technical diagnostics as the 'ℹ️ Статус' button."""
-    await update.message.reply_text(build_status_text(), reply_markup=main_keyboard())
+    """/status -- same diagnostics as the 'ℹ️ Статус' button, personalised
+    to the requesting user (shown/remaining counts in the daily-pool section)."""
+    caller_id = update.effective_user.id if update.effective_user else None
+    await update.message.reply_text(build_status_text(telegram_user_id=caller_id), reply_markup=main_keyboard())
 
 
 async def refresh_data_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -676,146 +678,225 @@ def _odds_api_status_text() -> str:
     return "неизвестно (ещё не было запросов)"
 
 
-def build_status_text() -> str:
-    """All technical/diagnostic information lives here -- the normal
-    prediction message never shows any of this. Per the strict daily
-    archive requirements, /status only ever READS existing persisted
-    state (the daily archive + the quota counter, both plain SQLite
-    reads) -- it never calls fixture discovery or any other live
-    API-Football endpoint, so pressing "ℹ️ Статус" can never itself spend
-    quota."""
-    ok_bot = "доступен" if TELEGRAM_BOT_TOKEN else "отсутствует"
-    ok_football = "доступен" if FOOTBALL_API_KEY else "отсутствует"
+def build_status_text(telegram_user_id: Optional[int] = None) -> str:
+    """User-facing status page. /status only ever READS persisted state
+    (daily archive, quota counter -- plain SQLite reads) -- never calls
+    fixture discovery or any API-Football endpoint, so pressing "ℹ️ Статус"
+    can never spend quota.
 
+    `telegram_user_id`, when provided, enables the per-user shown/remaining
+    counts in the daily-pool section (how many picks this specific user has
+    already seen today, and how many fresh ones remain for them)."""
     now_dt = datetime.now(timezone.utc)
+
+    # --- Collect all data from persisted state (read-only) ---
     requests_remaining_text = "неизвестно"
     requests_used_today_text = "неизвестно"
-    archive = None
+    pool_total = 0
+    pool_available = 0    # not started, enough lead time
+    pool_started = 0      # kicked off / too close
+    shown_count: Optional[int] = None
+    available_for_user: Optional[int] = None
+    archive_state_text = "отсутствует"
+    last_update_text = "ещё не было успешных обновлений"
+    next_update_text = "неизвестно"
+    source_text = "нет данных"
+    odds_api_credits_remaining_text = "неизвестно"
+    odds_api_last_request_text = "запросов ещё не было"
+    archive_error_notes: List[str] = []
 
     if FOOTBALL_API_KEY:
         try:
             football_cache = _open_football_cache(now_dt)
             requests_remaining_text = str(football_cache.requests_available())
             requests_used_today_text = str(football_cache.requests_used_today())
-            # /status is diagnostics-only and intentionally allowed to see
-            # a calendar-stale archive (to report it as such) -- it never
-            # presents it to the user as today's predictions.
-            archive = load_daily_archive(football_cache, now_dt, ignore_ttl=True, allow_stale_calendar_day=True)
+            # Allow a stale-calendar-day archive to be read here --
+            # /status reports on it honestly, never presents it as fresh.
+            archive = load_daily_archive(
+                football_cache, now_dt, ignore_ttl=True, allow_stale_calendar_day=True,
+            )
+
+            if archive is not None:
+                # Pool counts: how many entries are still bookable vs. kicked off.
+                for rec, _, _ in archive.pool:
+                    if rec.candidate.fixture.kickoff_utc > now_dt + timedelta(minutes=MIN_LEAD_TIME_MINUTES):
+                        pool_available += 1
+                    else:
+                        pool_started += 1
+                pool_total = pool_available + pool_started
+
+                # Per-user counts (only when the caller supplies a Telegram id).
+                if telegram_user_id is not None:
+                    shown_keys = football_cache.get_shown_keys(
+                        local_date_str(now_dt), telegram_user_id,
+                    )
+                    shown_count = len(shown_keys)
+                    available_for_user = sum(
+                        1 for rec, _, _ in archive.pool
+                        if rec.candidate.fixture.kickoff_utc > now_dt + timedelta(minutes=MIN_LEAD_TIME_MINUTES)
+                        and (rec.candidate.fixture.fixture_id, rec.candidate.market_key) not in shown_keys
+                    )
+
+                # Freshness label.
+                is_fresh = (
+                    not archive.is_stale_calendar_day
+                    and (now_dt - archive.generated_at) <= timedelta(hours=DAILY_ARCHIVE_TTL_HOURS)
+                )
+                if archive.is_stale_calendar_day:
+                    archive_state_text = "устарел (другой день в Екатеринбурге), будет пересобран при следующем запросе"
+                elif is_fresh:
+                    archive_state_text = "актуален"
+                else:
+                    archive_state_text = "устарел (>24ч), будет обновлён при следующем запросе"
+
+                last_update_text = format_user_time(archive.generated_at, now_dt)
+                next_update_text = format_user_time(
+                    archive.generated_at + timedelta(hours=DAILY_ARCHIVE_TTL_HOURS), now_dt,
+                )
+
+                # Source fix (requirement 3): archive.diagnostics["source"] is
+                # always "новый запрос" (set at save time); the authoritative
+                # "last response source" is in ai_predictions_last_diagnostics.
+                # After a process restart that source in memory, infer from
+                # whether a fresh valid archive exists (→ next response will
+                # come from archive).
+                if ai_predictions_last_diagnostics and "source" in ai_predictions_last_diagnostics:
+                    raw_source = ai_predictions_last_diagnostics["source"]
+                elif is_fresh:
+                    raw_source = "архив"
+                else:
+                    raw_source = archive.diagnostics.get("source", "")
+
+                if raw_source == "архив":
+                    source_text = "✅ архив текущего дня"
+                elif raw_source == "новый запрос":
+                    source_text = "🔄 новый запрос"
+                else:
+                    source_text = raw_source or "нет данных"
+
+                d = archive.diagnostics
+                odds_api_credits_remaining_text = d.get("odds_api_credits_remaining") or "неизвестно"
+                odds_raw = d.get("odds_api_last_request_at")
+                if odds_raw:
+                    try:
+                        odds_api_last_request_text = format_user_time(
+                            datetime.fromisoformat(odds_raw), now_dt,
+                        )
+                    except ValueError:
+                        odds_api_last_request_text = "неизвестно"
+                else:
+                    odds_api_last_request_text = "запросов ещё не было"
+
+                if d.get("errors"):
+                    archive_error_notes = d["errors"][:3]
+
             football_cache.close()
         except Exception:
             pass
 
-    if archive is not None:
-        archive_age_text = _format_ago(now_dt, archive.generated_at)
-        last_update_text = format_user_time(archive.generated_at, now_dt)
-        is_fresh = (
-            not archive.is_stale_calendar_day
-            and (now_dt - archive.generated_at) <= timedelta(hours=DAILY_ARCHIVE_TTL_HOURS)
-        )
-        if archive.is_stale_calendar_day:
-            archive_state_text = "устарел (другая календарная дата в Екатеринбурге), будет пересобран при следующем запросе"
-        elif is_fresh:
-            archive_state_text = "актуален"
-        else:
-            archive_state_text = "устарел (>24ч), будет обновлён при следующем запросе"
-        d = archive.diagnostics
-        found_text = str(d.get("found_fixtures", "неизвестно"))
-        matched_text = str(d.get("matched_fixtures", "неизвестно"))
-        unmatched_text = str(d.get("unmatched_fixtures_no_odds", "неизвестно"))
-        fully_stat_text = str(d.get("fully_stat_fixtures", "неизвестно"))
-        recs_text = str(d.get("recommendations_count", "неизвестно"))
-        excluded_no_odds_text = str(d.get("excluded_no_real_odds_count", 0))
-        source_text = d.get("source", "неизвестно")
-        odds_api_sports_queried_text = str(d.get("odds_api_sports_queried", 0))
-        odds_api_credits_remaining_text = d.get("odds_api_credits_remaining") or "неизвестно"
-        odds_api_last_request_raw = d.get("odds_api_last_request_at")
-        if odds_api_last_request_raw:
-            try:
-                odds_api_last_request_text = format_user_time(
-                    datetime.fromisoformat(odds_api_last_request_raw), now_dt,
-                )
-            except ValueError:
-                odds_api_last_request_text = "неизвестно"
-        else:
-            odds_api_last_request_text = "запросов ещё не было (архив не обновлялся с ключом The Odds API)"
+    # --- Assemble the message ---
+    lines: List[str] = ["ℹ️ Статус AI Ставки", ""]
+
+    # ── 📦 Daily pool ────────────────────────────────────────────────────
+    lines.append("📦 Дневной пул прогнозов:")
+    if pool_total > 0:
+        lines.append(f"  Всего найдено: {pool_total}")
+        lines.append(f"  Доступны сейчас: {pool_available}")
+        lines.append(f"  Уже начались / слишком близко: {pool_started}")
+        if shown_count is not None:
+            lines.append(f"  Показано вам сегодня: {shown_count}")
+            lines.append(f"  Ещё доступно для вас: {available_for_user}")
     else:
-        archive_age_text = "нет данных (архив ещё не сформирован)"
-        last_update_text = "ещё не было успешных обновлений"
-        archive_state_text = "отсутствует"
-        found_text = matched_text = unmatched_text = fully_stat_text = recs_text = excluded_no_odds_text = "0"
-        source_text = "нет данных"
-        odds_api_sports_queried_text = "0"
-        odds_api_credits_remaining_text = "неизвестно"
-        odds_api_last_request_text = "запросов ещё не было"
+        lines.append("  Пул не сформирован")
+    lines.append(f"  Состояние: {archive_state_text}")
+    lines.append(f"  Последнее обновление: {last_update_text}")
+    lines.append(f"  Следующее обновление: {next_update_text}")
+    lines.append(f"  Источник прогнозов: {source_text}")
+    lines.append(f"  Последний запрос к Odds API: {odds_api_last_request_text}")
+    lines.append(f"  Остаток кредитов Odds API: {odds_api_credits_remaining_text}")
+    if archive_error_notes:
+        lines.append(f"  Примечания: {'; '.join(archive_error_notes)}")
 
-    lines = [
-        "ℹ️ Статус AI Ставки",
-        "",
-        f"Telegram token: {ok_bot}",
-        f"API-Football key: {ok_football}",
-        f"Осталось запросов к API-Football сегодня: {requests_remaining_text}",
-        f"Использовано запросов к API-Football сегодня: {requests_used_today_text}",
-        "",
-        "Суточный архив прогнозов:",
-        f"Последнее успешное обновление: {last_update_text}",
-        f"Возраст архива: {archive_age_text} ({archive_state_text})",
-        f"Найдено матчей (API-Football): {found_text}",
-        f"Из них с реальными коэффициентами (The Odds API): {matched_text}",
-        f"Без реальных коэффициентов, не анализировались: {unmatched_text}",
-        f"Матчей с полной статистикой: {fully_stat_text}",
-        f"Сохранено рекомендаций: {recs_text}",
-        f"Исключено (нет реального коэффициента ни у одного букмекера): {excluded_no_odds_text}",
-        f"Источник последнего ответа пользователю: {source_text}",
-        "",
-        "The Odds API (защита лимита — один запрос в сутки на весь бот):",
-        f"Статус: {_odds_api_status_text()}",
-        f"Обращений при последнем обновлении архива: {odds_api_sports_queried_text}",
-        f"Осталось кредитов (по последнему ответу API): {odds_api_credits_remaining_text}",
-        f"Время последнего обращения: {odds_api_last_request_text}",
-        f"Источник текущих коэффициентов: {source_text}",
-        "",
-        "Кэш линии (хранится 30 минут):",
-        cache_status_lines(),
-    ]
-
-    if archive is not None and archive.diagnostics.get("errors"):
-        lines.append("")
-        lines.append(f"Примечания: {'; '.join(archive.diagnostics['errors'][:3])}")
-
+    # ── 🔴 Live ──────────────────────────────────────────────────────────
     lines.append("")
     lines.extend(_live_status_lines(now_dt))
+
+    # ── ⚙️ Diagnostics (technical / line cache) ──────────────────────────
+    lines += [
+        "",
+        "⚙️ Диагностика:",
+        f"  Telegram token: {'доступен' if TELEGRAM_BOT_TOKEN else 'отсутствует'}",
+        f"  API-Football key: {'доступен' if FOOTBALL_API_KEY else 'отсутствует'}",
+        f"  API-Football: использовано {requests_used_today_text}, осталось {requests_remaining_text} запросов",
+        f"  The Odds API: {_odds_api_status_text()}",
+        "",
+        "  Кэш линии (30 минут, кнопки ⚽🎾🏒🎯):",
+    ]
+    for cache_line in cache_status_lines().splitlines():
+        lines.append(f"    {cache_line}")
 
     return "\n".join(lines)
 
 
 def _live_status_lines(now_dt: datetime) -> List[str]:
-    """"🔴 Live" section of /status -- reads only the persisted Live
-    cache (never triggers a fetch), mirroring the read-only contract the
-    rest of build_status_text() already follows for the daily archive."""
-    age_text = "нет данных (Live ещё не запускался)"
-    diagnostics = live_predictions_last_diagnostics
+    """"🔴 Live" section of /status -- reads only the persisted Live cache
+    (never triggers a fetch).  Falls back to the cached result on disk
+    when the in-memory diagnostics dict is empty (e.g. after a restart)."""
+    last_check_text = "нет данных"
+    live_fixtures_text = "нет данных"
+    matched_odds_text = "нет данных"
+    source_text = "нет данных"
+    live_errors: List[str] = []
+
     if FOOTBALL_API_KEY:
         try:
             football_cache = _open_football_cache(now_dt)
             age_seconds = cache_age_seconds(football_cache, now_dt)
-            football_cache.close()
             if age_seconds is not None:
                 minutes = int(age_seconds // 60)
+                secs = int(age_seconds % 60)
                 fresh = age_seconds <= LIVE_CACHE_TTL_MINUTES * 60
-                age_text = f"{minutes} мин назад ({'актуален' if fresh else 'устарел, будет обновлён при следующем запросе'})"
+                last_check_text = (
+                    f"{minutes} мин {secs} сек назад "
+                    f"({'актуален' if fresh else 'устарел, обновится при следующем нажатии'})"
+                )
+            # Prefer the richer in-memory diagnostics; fall back to the
+            # serialised cache entry when those were cleared by a restart.
+            diag = live_predictions_last_diagnostics
+            if diag is None:
+                cached_result = load_cached_live_result(
+                    football_cache, ttl_minutes=LIVE_CACHE_TTL_MINUTES * 24 * 60,
+                )
+                if cached_result is not None:
+                    diag = {
+                        "live_fixture_count": cached_result.live_fixture_count,
+                        "matched_fixture_count": cached_result.matched_fixture_count,
+                        "errors": cached_result.errors,
+                        "from_cache": True,
+                    }
+            football_cache.close()
         except Exception:
-            pass
+            diag = live_predictions_last_diagnostics  # keep whatever we had
+    else:
+        diag = live_predictions_last_diagnostics
+
+    if diag:
+        live_fixtures_text = str(diag.get("live_fixture_count", 0))
+        matched_odds_text = str(diag.get("matched_fixture_count", 0))
+        from_cache = diag.get("from_cache", False)
+        source_text = "кэш (Odds API)" if from_cache else "Odds API"
+        if diag.get("errors"):
+            live_errors = diag["errors"][:2]
 
     lines = [
-        "🔴 Live-режим (отдельный от суточного архива):",
-        f"Возраст последних Live-данных: {age_text}",
+        "🔴 Live (отдельный от суточного пула):",
+        f"  Последняя проверка: {last_check_text}",
+        f"  Live матчей найдено: {live_fixtures_text}",
+        f"  Live коэффициентов найдено: {matched_odds_text}",
+        f"  Источник: {source_text}",
     ]
-    if diagnostics:
-        lines.append(f"Матчей идёт live: {diagnostics.get('live_fixture_count', 0)}")
-        lines.append(f"Сопоставлено с реальными коэффициентами: {diagnostics.get('matched_fixture_count', 0)}")
-        lines.append(f"Live-сигналов в последнем ответе: {diagnostics.get('recommendations_count', 0)}")
-        if diagnostics.get("errors"):
-            lines.append(f"Примечания: {'; '.join(diagnostics['errors'][:3])}")
+    if live_errors:
+        lines.append(f"  Примечания: {'; '.join(live_errors)}")
     return lines
 
 
@@ -825,7 +906,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.answer()
 
     if query.data == "status":
-        await query.message.reply_text(build_status_text(), reply_markup=main_keyboard())
+        caller_id = query.from_user.id if query.from_user else None
+        await query.message.reply_text(build_status_text(telegram_user_id=caller_id), reply_markup=main_keyboard())
         return
 
     if query.data == AI_PREDICTIONS_PREFIX:

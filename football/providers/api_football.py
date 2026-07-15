@@ -50,6 +50,11 @@ FINISHED_STATUSES = {"FT", "AET", "PEN"}
 
 _QUOTA_EXHAUSTED_REASON = "Достигнут лимит запросов к API-Football для этого запуска"
 
+#: Convenience alias -- max season the API-Football free plan allows.
+#: Kept here (not imported from value_config) to avoid a circular import;
+#: must stay in sync with API_FOOTBALL_FREE_PLAN_SEASONS in value_config.
+FREE_PLAN_MAX_SEASON = 2024
+
 
 def _season_for(now: Optional[datetime.datetime] = None) -> int:
     """European-style season year heuristic: seasons that span two calendar
@@ -215,6 +220,12 @@ class ApiFootballProvider(FootballStatisticsProvider):
 
     def _fetch_fixtures(self, team_id: int, count: int, mode: str) -> "tuple[Optional[List[Dict[str, Any]]], Optional[str]]":
         params: Dict[str, Any] = {"team": team_id}
+        # Always send an explicit season so API-Football can satisfy the
+        # request on the free plan, which only grants access to 2022-2024.
+        # `_season_for(now)` may return 2025 or later; clamping to
+        # FREE_PLAN_MAX_SEASON prevents "Free plans do not have access to
+        # this date" errors for every team-history call.
+        params["season"] = min(self.season, FREE_PLAN_MAX_SEASON)
         if mode == "last":
             params["last"] = count
         else:
