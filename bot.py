@@ -45,8 +45,14 @@ from ai_predictions.football_pipeline import (
     save_daily_archive,
 )
 from ai_predictions.prediction_report import render_nothing_left_for_user_message
-from ai_predictions.value_config import DAILY_ARCHIVE_TTL_HOURS
+from ai_predictions.value_config import DAILY_ARCHIVE_TTL_HOURS, LIVE_CACHE_TTL_MINUTES
 from ai_predictions.window import format_user_time, local_date_str
+
+# Live in-play predictions mode (2026-07-15, Task #11): its own, fully
+# independent pipeline/cache -- never shares a cache key, storage call, or
+# code path with the "🤖 Прогнозы ИИ" pipeline above (see
+# tests/test_live_pipeline_isolation.py).
+from ai_predictions.live_pipeline import cache_age_seconds, run_live_predictions_cached
 
 # The AI Betting Analytics module (analytics/) is a new, independent
 # top-level package -- like ai_predictions/, it is fine for bot.py to
@@ -76,6 +82,7 @@ ADMIN_TELEGRAM_IDS = {
 AI_PREDICTIONS_PREFIX = "ai_predictions"
 ADMIN_REFRESH_CONFIRM_PREFIX = "admin_refresh_confirm"
 STATISTICS_PREFIX = "analytics_stats"
+LIVE_PREDICTIONS_PREFIX = "live_predictions"
 MIN_CREDITS_FOR_AI_PREDICTIONS = 10
 CACHE_LABELS_AI_PREDICTIONS = "🤖 Прогнозы ИИ"
 
@@ -140,6 +147,13 @@ ai_predictions_last_diagnostics: Optional[Dict[str, Any]] = None
 # the first successful run since the process started.
 ai_predictions_last_success_ts: Optional[float] = None
 
+# "🔴 Live" mode's own lock + last-diagnostics mirror (2026-07-15, Task
+# #11) -- deliberately separate variables from the ai_predictions_* ones
+# above so Live's own 10-minute cache/lock can never interact with, block,
+# or be confused with the daily pre-match archive/lock.
+live_predictions_lock = asyncio.Lock()
+live_predictions_last_diagnostics: Optional[Dict[str, Any]] = None
+
 
 def _open_football_cache(now: datetime) -> FootballCache:
     """Single seam for opening the persistent API-Football cache/archive
@@ -158,6 +172,7 @@ def main_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🏒 Хоккей", callback_data="odds:hockey"),
         ],
         [InlineKeyboardButton("🤖 Прогнозы ИИ", callback_data=AI_PREDICTIONS_PREFIX)],
+        [InlineKeyboardButton("🔴 Live", callback_data=LIVE_PREDICTIONS_PREFIX)],
         [InlineKeyboardButton("📈 Статистика", callback_data=STATISTICS_PREFIX)],
         [InlineKeyboardButton("ℹ️ Статус", callback_data="status")],
     ])
@@ -561,6 +576,56 @@ async def handle_ai_predictions(query, *, force_refresh: bool = False) -> None:
         football_cache.close()
 
 
+async def handle_live_predictions(query) -> None:
+    """"🔴 Live" button (2026-07-15, Task #11): fully independent of
+    "🤖 Прогнозы ИИ" -- its own cache key, its own lock, its own
+    tracking/analytics mode marker (mode="live"). Never touches the
+    shared daily archive/pool and never blocks (or is blocked by) the
+    pre-match flow's lock."""
+    global live_predictions_last_diagnostics
+
+    if not FOOTBALL_API_KEY:
+        await query.message.reply_text(
+            "❌ Для Live-режима нужен ключ: FOOTBALL_API_KEY.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    if live_predictions_lock.locked():
+        await query.message.reply_text(
+            "⏳ Live-данные уже обновляются. Подожди немного и нажми кнопку снова.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    async with live_predictions_lock:
+        now_dt = datetime.now(timezone.utc)
+        football_cache = _open_football_cache(now_dt)
+        try:
+            try:
+                result = await asyncio.to_thread(
+                    run_live_predictions_cached,
+                    football_cache=football_cache, now=now_dt, ttl_minutes=LIVE_CACHE_TTL_MINUTES,
+                )
+                live_predictions_last_diagnostics = {
+                    "live_fixture_count": result.live_fixture_count,
+                    "matched_fixture_count": result.matched_fixture_count,
+                    "recommendations_count": result.recommendations_count,
+                    "saved_count": result.saved_count,
+                    "duplicate_count": result.duplicate_count,
+                    "errors": result.errors,
+                    "from_cache": result.from_cache,
+                    "generated_at": result.generated_at.isoformat() if result.generated_at else None,
+                }
+                messages = result.telegram_messages or ["Live-сигналов сейчас нет."]
+                for message in messages:
+                    await query.message.reply_text(message, reply_markup=main_keyboard())
+            except Exception as e:
+                await query.message.reply_text(f"❌ Ошибка при получении Live-прогнозов: {e}", reply_markup=main_keyboard())
+        finally:
+            football_cache.close()
+
+
 async def reset_shown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/reset_shown -- admin-only. Clears only the CALLING admin's own
     per-user shown-history for the current Yekaterinburg calendar day, so
@@ -717,7 +782,41 @@ def build_status_text() -> str:
         lines.append("")
         lines.append(f"Примечания: {'; '.join(archive.diagnostics['errors'][:3])}")
 
+    lines.append("")
+    lines.extend(_live_status_lines(now_dt))
+
     return "\n".join(lines)
+
+
+def _live_status_lines(now_dt: datetime) -> List[str]:
+    """"🔴 Live" section of /status -- reads only the persisted Live
+    cache (never triggers a fetch), mirroring the read-only contract the
+    rest of build_status_text() already follows for the daily archive."""
+    age_text = "нет данных (Live ещё не запускался)"
+    diagnostics = live_predictions_last_diagnostics
+    if FOOTBALL_API_KEY:
+        try:
+            football_cache = _open_football_cache(now_dt)
+            age_seconds = cache_age_seconds(football_cache, now_dt)
+            football_cache.close()
+            if age_seconds is not None:
+                minutes = int(age_seconds // 60)
+                fresh = age_seconds <= LIVE_CACHE_TTL_MINUTES * 60
+                age_text = f"{minutes} мин назад ({'актуален' if fresh else 'устарел, будет обновлён при следующем запросе'})"
+        except Exception:
+            pass
+
+    lines = [
+        "🔴 Live-режим (отдельный от суточного архива):",
+        f"Возраст последних Live-данных: {age_text}",
+    ]
+    if diagnostics:
+        lines.append(f"Матчей идёт live: {diagnostics.get('live_fixture_count', 0)}")
+        lines.append(f"Сопоставлено с реальными коэффициентами: {diagnostics.get('matched_fixture_count', 0)}")
+        lines.append(f"Live-сигналов в последнем ответе: {diagnostics.get('recommendations_count', 0)}")
+        if diagnostics.get("errors"):
+            lines.append(f"Примечания: {'; '.join(diagnostics['errors'][:3])}")
+    return lines
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -731,6 +830,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if query.data == AI_PREDICTIONS_PREFIX:
         await handle_ai_predictions(query)
+        return
+
+    if query.data == LIVE_PREDICTIONS_PREFIX:
+        await handle_live_predictions(query)
         return
 
     if query.data == STATISTICS_PREFIX:

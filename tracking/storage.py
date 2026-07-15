@@ -95,7 +95,8 @@ class TrackingStorage:
                     matching_confidence REAL,
                     sample_size_category TEXT,
                     market_probability REAL,
-                    statistics_probability REAL
+                    statistics_probability REAL,
+                    mode TEXT NOT NULL DEFAULT 'pre_match'
                 )
                 """
             )
@@ -163,6 +164,7 @@ class TrackingStorage:
             "sample_size_category": "TEXT",
             "market_probability": "REAL",
             "statistics_probability": "REAL",
+            "mode": "TEXT NOT NULL DEFAULT 'pre_match'",
         }
         for column, coltype in needed.items():
             if column not in existing:
@@ -193,7 +195,7 @@ class TrackingStorage:
             "statistics_source", "statistics_cached", "statistics_completeness",
             "statistics_score", "final_combined_score",
             "fixture_id", "matching_confidence", "sample_size_category",
-            "market_probability", "statistics_probability",
+            "market_probability", "statistics_probability", "mode",
         ]
         placeholders = ", ".join(f":{c}" for c in columns)
         sql = f"INSERT INTO predictions ({', '.join(columns)}) VALUES ({placeholders})"

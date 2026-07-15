@@ -290,6 +290,20 @@ class ApiFootballProvider(FootballStatisticsProvider):
             return Stat.missing(f"API-Football не вернул матчей на дату {date_str}")
         return Stat.ok(response)
 
+    def get_live_fixtures(self) -> Stat[List[Dict[str, Any]]]:
+        """Real, raw `/fixtures?live=all` response -- every real fixture
+        currently in progress anywhere, right now (score/minute/period
+        included by API-Football on this endpoint). Used exclusively by
+        the Live in-play mode (ai_predictions/live_fixtures.py); never
+        touches the pre-match fixture-discovery cache or budget
+        bookkeeping beyond the normal shared request counter. An empty
+        response is a real, valid answer (no matches live right now),
+        not an error."""
+        response, error = self._get("/fixtures", {"live": "all"})
+        if error:
+            return Stat.missing(error)
+        return Stat.ok(response or [])
+
     def get_predictions(self, fixture_id: int) -> Stat[Dict[str, Any]]:
         """Real, raw `/predictions?fixture=` response for one fixture --
         API-Football's own win/draw/win percent model, advice text and

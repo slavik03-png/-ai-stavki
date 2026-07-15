@@ -41,7 +41,27 @@ def _best_worst(groups: List[Dict[str, Any]], *, min_settled: int = 3) -> "tuple
     return best, worst
 
 
+def _mode_block(storage: AnalyticsStorage, *, stake: float, mode: Optional[str], title: str) -> List[str]:
+    """One overall/pre-match/Live block for compact_report -- `mode=None`
+    means the combined figure across both analysis modes."""
+    overall = storage.overall_stats(stake=stake, mode=mode)
+    if mode is not None and overall["total_predictions"] == 0:
+        return [f"{title}: пока нет прогнозов"]
+    return [
+        title + ":",
+        f"  Всего прогнозов: {overall['total_predictions']}",
+        f"  Рассчитано: {overall['settled_predictions']}",
+        f"  Процент побед: {_fmt_pct(overall['win_rate'])}",
+        f"  ROI: {_fmt_pct(overall['roi'])}",
+        f"  Прибыль (при ставке {stake:g}): {_fmt_money(overall['profit'])}",
+    ]
+
+
 def compact_report(storage: AnalyticsStorage, *, stake: float = DEFAULT_STAKE, now: Optional[datetime.datetime] = None) -> str:
+    """Public '📈 Статистика' report -- combined overall figures first, then
+    the same figures split by analysis mode (pre-match vs. Live in-play),
+    since the two pipelines analyse structurally different situations and
+    a single blended number would hide how each one is actually doing."""
     now = now or datetime.datetime.now(datetime.timezone.utc)
     overall = storage.overall_stats(stake=stake)
     signal_groups = storage.group_stats("signal_level", stake=stake)
@@ -55,12 +75,14 @@ def compact_report(storage: AnalyticsStorage, *, stake: float = DEFAULT_STAKE, n
     lines = [
         "📈 Статистика AI Ставки",
         "",
-        f"Всего прогнозов: {overall['total_predictions']}",
-        f"Рассчитано: {overall['settled_predictions']}",
-        f"Процент побед: {_fmt_pct(overall['win_rate'])}",
-        f"ROI: {_fmt_pct(overall['roi'])}",
-        f"Прибыль (при ставке {stake:g}): {_fmt_money(overall['profit'])}",
     ]
+    lines.extend(_mode_block(storage, stake=stake, mode=None, title="Всего (пред-матч + Live)"))
+    lines.append("")
+    lines.extend(_mode_block(storage, stake=stake, mode="pre_match", title="Пред-матч"))
+    lines.append("")
+    lines.extend(_mode_block(storage, stake=stake, mode="live", title="🔴 Live"))
+    lines.append("")
+
     if best_signal:
         lines.append(f"Лучший уровень сигнала: {best_signal['key']} (ROI {_fmt_pct(best_signal['roi'])})")
     if worst_signal and worst_signal is not best_signal:

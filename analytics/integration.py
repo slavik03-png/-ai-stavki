@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 def record_recommendation(
     analytics_storage: AnalyticsStorage, rec: Any, odds: float, *,
     model_version: str, archive_version: str, now: Optional[datetime.datetime] = None,
+    mode: str = "pre_match",
 ) -> None:
     """`rec` is a RankedRecommendation from ai_predictions/prediction_selector.py
     (has .candidate and .signal_level); never imported by type here to avoid
@@ -29,7 +30,11 @@ def record_recommendation(
     `odds` must be a real, confirmed bookmaker price. Callers only ever
     record a recommendation that already survived the real-odds gate in
     football_pipeline.run_football_predictions, so this never fabricates
-    an implied-probability price for a missing real coefficient."""
+    an implied-probability price for a missing real coefficient.
+
+    `mode` ('pre_match'/'live') is folded into AnalyticsStorage's dedup
+    key so a Live in-play pick can never collide with a pre-match pick on
+    the exact same fixture/market."""
     try:
         c = rec.candidate
         fixture = c.fixture
@@ -51,6 +56,7 @@ def record_recommendation(
             "model_version": model_version,
             "archive_version": archive_version,
             "prediction_source": "api_football+the_odds_api",
+            "mode": mode,
         }
         analytics_storage.record_prediction(row)
     except Exception:  # never let analytics recording break the real pipeline

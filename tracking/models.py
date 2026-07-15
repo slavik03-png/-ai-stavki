@@ -70,12 +70,25 @@ def new_prediction_id() -> str:
     return str(uuid.uuid4())
 
 
+#: Live in-play mode marker (ai_predictions/value_config.py mirrors these
+#: exact strings as PREDICTION_MODE_PRE_MATCH/PREDICTION_MODE_LIVE -- kept
+#: as plain strings here, not an import, so tracking/ has no dependency on
+#: ai_predictions/). "pre_match" is the default so every row saved before
+#: Live mode existed reads back with its original real meaning unchanged.
+MODE_PRE_MATCH = "pre_match"
+MODE_LIVE = "live"
+ALL_MODES = {MODE_PRE_MATCH, MODE_LIVE}
+
+
 def dedup_key(event_id: str, market_type: str, selection: str,
-              line: Optional[float], model_version: str) -> str:
+              line: Optional[float], model_version: str, mode: str = MODE_PRE_MATCH) -> str:
     """Stable uniqueness key: same bet on the same event/model must never be
-    stored twice, even if issued again by mistake."""
+    stored twice, even if issued again by mistake. `mode` keeps a live
+    in-play pick and a pre-match pick on the exact same fixture/market from
+    ever colliding as "the same prediction" -- they are analysed by
+    different pipelines at different real moments in the match."""
     line_part = "none" if line is None else f"{float(line):.2f}"
-    return f"{event_id}|{market_type}|{selection}|{line_part}|{model_version}"
+    return f"{event_id}|{market_type}|{selection}|{line_part}|{model_version}|{mode}"
 
 
 @dataclass
@@ -135,6 +148,11 @@ class Prediction:
     market_probability: Optional[float] = None
     statistics_probability: Optional[float] = None
 
+    # -- Live in-play predictions mode (optional, backward compatible:
+    #    every row saved before this feature existed simply defaults to
+    #    "pre_match", its real original meaning). --
+    mode: str = MODE_PRE_MATCH
+
     def __post_init__(self) -> None:
         if self.recommendation_group not in RECOMMENDATION_GROUPS:
             raise ValueError(
@@ -147,11 +165,13 @@ class Prediction:
             raise ValueError(
                 f"invalid signal_level {self.signal_level!r}, must be one of {sorted(SIGNAL_LEVELS)} or None"
             )
+        if self.mode not in ALL_MODES:
+            raise ValueError(f"invalid mode {self.mode!r}, must be one of {sorted(ALL_MODES)}")
 
     @property
     def dedup_key(self) -> str:
         return dedup_key(self.event_id, self.market_type, self.selection,
-                          self.line, self.model_version)
+                          self.line, self.model_version, self.mode)
 
 
 @dataclass

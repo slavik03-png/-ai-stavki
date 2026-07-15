@@ -106,10 +106,12 @@ class AnalyticsStorage:
                     model_version TEXT,
                     archive_version TEXT,
                     prediction_source TEXT,
+                    mode TEXT NOT NULL DEFAULT 'pre_match',
                     dedup_key TEXT NOT NULL UNIQUE
                 )
                 """
             )
+            self._add_missing_columns()
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS results (
@@ -157,14 +159,29 @@ class AnalyticsStorage:
                     """
                 )
 
+    def _add_missing_columns(self) -> None:
+        """Additive-only migration for databases created before the Live
+        in-play mode existed: adds any missing columns with ALTER TABLE ADD
+        COLUMN. Never drops or renames a column -- old rows simply read
+        back with the real default ('pre_match', their original meaning)."""
+        existing = {row["name"] for row in self._conn.execute("PRAGMA table_info(predictions)").fetchall()}
+        needed = {"mode": "TEXT NOT NULL DEFAULT 'pre_match'"}
+        for column, coltype in needed.items():
+            if column not in existing:
+                self._conn.execute(f"ALTER TABLE predictions ADD COLUMN {column} {coltype}")
+
     # -- predictions ------------------------------------------------------------
 
     def record_prediction(self, row: Dict[str, Any]) -> Optional[int]:
         """Inserts one permanent prediction row. Returns the new row id, or
-        None if this exact (fixture_id, market) was already recorded before
-        (duplicate protection -- e.g. the daily archive got recomputed
-        twice) -- the existing row is left untouched either way."""
-        dedup_key = f"{row.get('fixture_id')}|{row.get('market')}"
+        None if this exact (fixture_id, market, mode) was already recorded
+        before (duplicate protection -- e.g. the daily archive got
+        recomputed twice) -- the existing row is left untouched either way.
+        `mode` ('pre_match'/'live') is folded into the dedup key so a live
+        in-play pick can never collide with a pre-match pick on the exact
+        same fixture/market."""
+        mode = row.get("mode") or "pre_match"
+        dedup_key = f"{row.get('fixture_id')}|{row.get('market')}|{mode}"
         with self._lock, self._conn:
             existing = self._conn.execute(
                 "SELECT id FROM predictions WHERE dedup_key = ?", (dedup_key,)
@@ -177,8 +194,8 @@ class AnalyticsStorage:
                     created_at, match_datetime, sport, country, league, fixture_id,
                     home_team, away_team, market, market_label, selection, odds,
                     estimated_probability, signal_level, reason, model_version,
-                    archive_version, prediction_source, dedup_key
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    archive_version, prediction_source, mode, dedup_key
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     self._now_iso(), row.get("match_datetime"), row.get("sport"),
@@ -187,7 +204,7 @@ class AnalyticsStorage:
                     row.get("market_label"), row.get("selection"), row.get("odds"),
                     row.get("estimated_probability"), row.get("signal_level"),
                     row.get("reason"), row.get("model_version"), row.get("archive_version"),
-                    row.get("prediction_source"), dedup_key,
+                    row.get("prediction_source"), mode, dedup_key,
                 ),
             )
             return cur.lastrowid
@@ -303,22 +320,32 @@ class AnalyticsStorage:
 
     def overall_stats(
         self, *, stake: float = DEFAULT_STAKE, since: Optional[str] = None, until: Optional[str] = None,
+        mode: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """`mode` ('pre_match'/'live'), if given, restricts the aggregate to
+        only that analysis mode -- lets '📈 Статистика' report pre-match
+        and Live performance separately, on top of the combined overall
+        figure (mode=None)."""
         rows = self.all_predictions_with_results()
         if since is not None:
             rows = [r for r in rows if (r["created_at"] or "") >= since]
         if until is not None:
             rows = [r for r in rows if (r["created_at"] or "") < until]
+        if mode is not None:
+            rows = [r for r in rows if (r["mode"] or "pre_match") == mode]
         return _aggregate(rows, stake)
 
     def group_stats(
         self, group_col: str, *, stake: float = DEFAULT_STAKE, since: Optional[str] = None, until: Optional[str] = None,
+        mode: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         rows = self.all_predictions_with_results()
         if since is not None:
             rows = [r for r in rows if (r["created_at"] or "") >= since]
         if until is not None:
             rows = [r for r in rows if (r["created_at"] or "") < until]
+        if mode is not None:
+            rows = [r for r in rows if (r["mode"] or "pre_match") == mode]
         grouped: Dict[str, List[sqlite3.Row]] = {}
         for row in rows:
             key = row[group_col] or "unknown"

@@ -392,3 +392,31 @@ SIGNAL_EMOJI_RU_CARD = {
     SIGNAL_MEDIUM: "🟡",
     SIGNAL_LOW: "⚪",
 }
+
+# ---------------------------------------------------------------------------
+# Live in-play predictions mode (2026-07-15): a second, independent analysis
+# mode for matches already in progress -- never touches the shared daily
+# archive/pool above. Uses the same real cross-bookmaker consensus math as
+# ai_predictions/value_engine.py (leave-one-out consensus vs. best price),
+# since API-Football's own /predictions endpoint is a pre-match model and
+# has no real opinion once a match has kicked off. A live fixture with no
+# real, currently-matched bookmaker price is dropped, never estimated.
+# ---------------------------------------------------------------------------
+
+#: How long one fetched Live result (fixtures + matched odds + rendered
+#: cards) stays valid before the next "🔴 Live" press is allowed to spend a
+#: fresh API-Football + Odds API request. Deliberately much shorter than
+#: DAILY_ARCHIVE_TTL_HOURS -- in-play scores/minutes/odds move fast.
+LIVE_CACHE_TTL_MINUTES = 10.0
+
+#: At most this many live picks are ever shown at once -- same cap
+#: philosophy as MAX_TOTAL_SIGNALS, kept as its own named constant since
+#: Live mode is a fully separate pipeline from the pre-match one.
+LIVE_MAX_RECOMMENDATIONS = 5
+
+#: Mode marker values stored on every tracking.models.Prediction /
+#: analytics prediction row, so a live pick can never collide (via
+#: dedup_key) with a pre-match pick on the same fixture/market, and so
+#: "📈 Статистика" can report pre-match and Live figures separately.
+PREDICTION_MODE_PRE_MATCH = "pre_match"
+PREDICTION_MODE_LIVE = "live"
