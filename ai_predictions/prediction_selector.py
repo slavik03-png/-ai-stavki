@@ -20,11 +20,13 @@ Rules (exactly the production-fix spec):
 
 from __future__ import annotations
 
+import datetime
 from dataclasses import dataclass
 from typing import List, Optional
 
 from ai_predictions.football_predictions import MarketCandidate
 from ai_predictions.value_config import (
+    MIN_LEAD_TIME_MINUTES,
     PROB_HIGH_MIN,
     PROB_HIGH_MIN_COMPLETENESS,
     PROB_LOW_MIN,
@@ -78,7 +80,14 @@ def best_candidate_per_fixture(all_candidates: List[MarketCandidate]) -> List[Ma
     return list(best_by_fixture.values())
 
 
-def select_recommendations(all_candidates: List[MarketCandidate]) -> List[RankedRecommendation]:
+def rank_all_candidates(all_candidates: List[MarketCandidate]) -> List[RankedRecommendation]:
+    """The FULL ranked pool (best-first), deliberately never sliced to
+    MAX_RECOMMENDATIONS here. Request-time re-selection (2026-07-15
+    change, see select_current_recommendations below) needs the whole
+    pool persisted so a later request -- once some fixtures have already
+    kicked off -- can still find real, still-startable candidates that
+    did not make the very first cut. Slicing early would permanently
+    throw those away."""
     per_fixture = best_candidate_per_fixture(all_candidates)
     ranked: List[RankedRecommendation] = []
     for c in per_fixture:
@@ -89,4 +98,48 @@ def select_recommendations(all_candidates: List[MarketCandidate]) -> List[Ranked
 
     tier_order = {SIGNAL_HIGH: 0, SIGNAL_MEDIUM: 1, SIGNAL_LOW: 2}
     ranked.sort(key=lambda r: (tier_order[r.signal_level], -r.candidate.probability))
-    return ranked[:MAX_RECOMMENDATIONS]
+    return ranked
+
+
+def select_recommendations(all_candidates: List[MarketCandidate]) -> List[RankedRecommendation]:
+    """Kept for callers/tests that only care about "the best N candidates
+    right now, regardless of kickoff time" (no time-based exclusion) --
+    e.g. unit tests that build candidates with no real kickoff constraint
+    in mind. The real production pipeline uses rank_all_candidates +
+    select_current_recommendations instead, see football_pipeline.py."""
+    return rank_all_candidates(all_candidates)[:MAX_RECOMMENDATIONS]
+
+
+def has_enough_lead_time(
+    kickoff_utc: datetime.datetime,
+    now: datetime.datetime,
+    min_lead_minutes: float = MIN_LEAD_TIME_MINUTES,
+) -> bool:
+    """True only if the fixture starts strictly after `now` AND at least
+    `min_lead_minutes` from now. Excludes matches that have already
+    kicked off, already finished, or start too soon for a user to
+    realistically still place a bet -- never guessed, always a direct
+    comparison against the real kickoff timestamp."""
+    return kickoff_utc > now + datetime.timedelta(minutes=min_lead_minutes)
+
+
+def select_current_recommendations(
+    ranked: List[RankedRecommendation],
+    now: datetime.datetime,
+    *,
+    min_lead_minutes: float = MIN_LEAD_TIME_MINUTES,
+    max_count: int = MAX_RECOMMENDATIONS,
+) -> List[RankedRecommendation]:
+    """Re-selects from an already best-first-ranked pool (see
+    rank_all_candidates) for THIS exact moment: fixtures that have
+    started, finished, or start too soon (< min_lead_minutes away) are
+    excluded first, then the best `max_count` of whatever real
+    candidates remain are kept. Never pads with a weaker/fake candidate
+    just to reach `max_count` -- if fewer real candidates remain after
+    the time filter, only those are returned. Order is preserved from
+    `ranked`, which must already be best-first sorted."""
+    eligible = [
+        r for r in ranked
+        if has_enough_lead_time(r.candidate.fixture.kickoff_utc, now, min_lead_minutes)
+    ]
+    return eligible[:max_count]

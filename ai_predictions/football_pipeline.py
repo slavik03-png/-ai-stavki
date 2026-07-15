@@ -1,8 +1,16 @@
 """
-Production v4 orchestration (odds-first, 2026-07-15 rearchitecture):
-real, currently-quoted Odds API bookmaker coverage now GATES which real
-API-Football fixtures are worth analysing at all, instead of being an
-afterthought that dropped good candidates once no bookmaker covered them.
+Production v5 orchestration (request-time re-selection, 2026-07-15):
+real, currently-quoted Odds API bookmaker coverage GATES which real
+API-Football fixtures are worth analysing at all (unchanged from v4),
+but the FULL ranked pool of real, odds-backed candidates for the day is
+now persisted in the daily archive -- not just a fixed top-5 rendered
+once. Every user request re-filters that pool against the CURRENT
+moment (excluding fixtures that already started/finished, and any
+starting within MIN_LEAD_TIME_MINUTES) and picks the best up-to-5 of
+whatever real candidates remain, so a later request automatically picks
+up fresh candidates once earlier ones are no longer bettable -- without
+spending any additional API-Football/Odds API quota. See
+.agents/memory/request-time-reselection.md.
 
 Pipeline:
   discover real fixtures in the strict 36h window (API-Football, 6h-
@@ -12,12 +20,13 @@ Pipeline:
   (ai_predictions/fixture_matching.py) -> analyse ONLY the matched
   fixtures (up to MAX_FIXTURES_ANALYSED_PER_RUN, soonest kickoff first)
   from API-Football data (statistics/predictions model, never the odds
-  themselves) -> pick the single best real market per fixture, classify
-  HIGH/MEDIUM/LOW/omit by the probability+completeness thresholds, keep
-  up to 5 -> attach the real bookmaker price for each kept
-  recommendation's chosen market from the SAME match result (no second
-  fetch) -> persist every kept recommendation to tracking -> render the
-  exact Russian card format.
+  themselves) -> rank EVERY fixture that clears the probability
+  threshold (not just the top 5), classify HIGH/MEDIUM/LOW -> attach the
+  real bookmaker price for each ranked candidate's chosen market from
+  the SAME match result (no second fetch) and drop any candidate with no
+  real matched price -> persist the resulting pool + re-select the best
+  (up to 5) still-startable candidates for right now -> persist those to
+  tracking -> render the exact Russian card format.
 
 Why: analysing a fixture no real bookmaker currently quotes always ended
 in that candidate being dropped at the very end anyway, wasting
@@ -30,7 +39,8 @@ actually become a real, prosentable recommendation, which is what makes
 a daily minimum of a few real-odds recommendations achievable.
 
 See .agents/memory/odds-first-fixture-gating.md for the design rationale
-and how this supersedes the older API-Football-primary rule.
+of the odds-first gate, and .agents/memory/request-time-reselection.md
+for why the daily archive stores a pool instead of a fixed message.
 """
 
 from __future__ import annotations
@@ -39,21 +49,26 @@ import datetime
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ai_predictions.fixture_matching import FixtureMatch, match_fixtures_to_events
-from ai_predictions.fixtures import FixtureDiscoveryResult, discover_fixtures_in_window
+from ai_predictions.fixtures import Fixture, FixtureDiscoveryResult, discover_fixtures_in_window
 from ai_predictions.football_cache import FootballCache
 from ai_predictions.football_predictions import MarketCandidate, build_candidates_for_fixture
 from ai_predictions.odds_client import QUOTA_EXHAUSTED_MARKER, fetch_all_active_football_events
 from ai_predictions.odds_lookup import OddsLookupResult, attach_prices_from_matches
 from ai_predictions.prediction_report import render_predictions_message
-from ai_predictions.prediction_selector import RankedRecommendation, select_recommendations
+from ai_predictions.prediction_selector import (
+    RankedRecommendation,
+    rank_all_candidates,
+    select_current_recommendations,
+)
 from ai_predictions.value_config import (
     BET_MARKET_LABELS_RU,
     DAILY_ARCHIVE_LOCK_TTL_MINUTES,
     DAILY_ARCHIVE_TTL_HOURS,
     MAX_FIXTURES_ANALYSED_PER_RUN,
+    MIN_LEAD_TIME_MINUTES,
     SIGNAL_HIGH,
     SIGNAL_LOW,
     SIGNAL_MEDIUM,
@@ -131,14 +146,191 @@ class FootballPipelineResult:
     saved_count: int = 0
     duplicate_count: int = 0
     errors: List[str] = field(default_factory=list)
+    #: The FULL real, odds-backed ranked pool for the day (2026-07-15
+    #: change) -- everything that cleared the probability threshold AND
+    #: has a real matched bookmaker price, in best-first order, never
+    #: sliced to 5. `recommendations`/`telegram_messages` above are only
+    #: this run's initial request-time selection from this same pool
+    #: (see select_and_render) -- the pool itself is what gets archived,
+    #: so a later request can re-select without spending quota again.
+    pool: List["PoolEntry"] = field(default_factory=list)
+
+
+#: One real, odds-backed ranked candidate: the recommendation itself,
+#: its real matched bookmaker price, and the bookmaker's own name. This
+#: is the unit the daily archive persists -- see module docstring.
+PoolEntry = Tuple[RankedRecommendation, float, str]
+
+
+def _serialize_fixture(fixture: Fixture) -> Dict[str, Any]:
+    return {
+        "fixture_id": fixture.fixture_id,
+        "kickoff_utc": fixture.kickoff_utc.isoformat(),
+        "home_team": fixture.home_team,
+        "away_team": fixture.away_team,
+        "home_team_id": fixture.home_team_id,
+        "away_team_id": fixture.away_team_id,
+        "league_name": fixture.league_name,
+        "league_country": fixture.league_country,
+        "status_short": fixture.status_short,
+    }
+
+
+def _deserialize_fixture(data: Dict[str, Any]) -> Fixture:
+    return Fixture(
+        fixture_id=data["fixture_id"],
+        kickoff_utc=datetime.datetime.fromisoformat(data["kickoff_utc"]),
+        home_team=data["home_team"],
+        away_team=data["away_team"],
+        home_team_id=data.get("home_team_id"),
+        away_team_id=data.get("away_team_id"),
+        league_name=data.get("league_name"),
+        league_country=data.get("league_country"),
+        status_short=data.get("status_short", ""),
+    )
+
+
+def _serialize_pool_entry(entry: PoolEntry) -> Dict[str, Any]:
+    rec, odds, bookmaker = entry
+    c = rec.candidate
+    return {
+        "fixture": _serialize_fixture(c.fixture),
+        "market_key": c.market_key,
+        "market_label_ru": c.market_label_ru,
+        "probability": c.probability,
+        "completeness": c.completeness,
+        "sample_size_category": c.sample_size_category,
+        "rationale": c.rationale,
+        "source": c.source,
+        "signal_level": rec.signal_level,
+        "odds": odds,
+        "bookmaker": bookmaker,
+    }
+
+
+def _deserialize_pool_entry(data: Dict[str, Any]) -> PoolEntry:
+    candidate = MarketCandidate(
+        fixture=_deserialize_fixture(data["fixture"]),
+        market_key=data["market_key"],
+        market_label_ru=data["market_label_ru"],
+        probability=data["probability"],
+        completeness=data["completeness"],
+        sample_size_category=data["sample_size_category"],
+        rationale=data["rationale"],
+        source=data["source"],
+    )
+    rec = RankedRecommendation(candidate=candidate, signal_level=data["signal_level"])
+    return rec, data["odds"], data["bookmaker"]
+
+
+def select_and_render(
+    pool: List[PoolEntry],
+    now: datetime.datetime,
+    *,
+    found_fixtures: int,
+    analysed_fixtures: int,
+    matched_fixtures: Optional[int] = None,
+    excluded_no_real_odds_count: int = 0,
+    min_lead_minutes: float = MIN_LEAD_TIME_MINUTES,
+) -> Tuple[List[str], List[PoolEntry]]:
+    """The one place request-time re-selection happens (2026-07-15
+    change): given the FULL persisted pool for the day and the CURRENT
+    moment, excludes anything already started/finished or starting within
+    `min_lead_minutes`, keeps the best up-to-5 of whatever real
+    candidates remain, and renders the exact card format for them. Pure
+    CPU -- no network call, safe to call on every button press and from
+    /status-adjacent code paths."""
+    ranked = [entry[0] for entry in pool]
+    selected_recs = select_current_recommendations(ranked, now, min_lead_minutes=min_lead_minutes)
+    by_fixture_id = {entry[0].candidate.fixture.fixture_id: entry for entry in pool}
+    selected_entries = [by_fixture_id[rec.candidate.fixture.fixture_id] for rec in selected_recs]
+    odds_and_bookmaker_by_fixture = {
+        fid: (odds, bookmaker) for fid, (_, odds, bookmaker) in
+        ((entry[0].candidate.fixture.fixture_id, entry) for entry in selected_entries)
+    }
+    messages = render_predictions_message(
+        selected_recs, odds_and_bookmaker_by_fixture,
+        found_fixtures=found_fixtures, analysed_fixtures=analysed_fixtures,
+        candidates_without_odds=excluded_no_real_odds_count,
+        matched_fixtures=matched_fixtures,
+    )
+    return messages, selected_entries
+
+
+def persist_selected(
+    selected_entries: List[PoolEntry],
+    storage: TrackingStorage,
+    analytics_storage: AnalyticsStorage,
+    now: datetime.datetime,
+) -> Tuple[int, int]:
+    """Saves the currently-selected entries to tracking + analytics.
+    `storage.save_prediction`'s dedup_key (event_id+market+selection+
+    model_version, see tracking/models.py) already guarantees a fixture
+    picked again on a later re-selection (because it was still startable)
+    is never double-saved -- it simply reports a duplicate, exactly like
+    the existing single-run behaviour."""
+    archive_version = now.date().isoformat()
+    saved, duplicates = 0, 0
+    for rec, odds, _bookmaker in selected_entries:
+        prediction = _recommendation_to_prediction(rec, odds)
+        try:
+            storage.save_prediction(prediction)
+            saved += 1
+        except DuplicatePredictionError:
+            duplicates += 1
+        # Never allowed to raise or affect the counters above.
+        record_recommendation(
+            analytics_storage, rec, odds,
+            model_version=FOOTBALL_PIPELINE_MODEL_VERSION, archive_version=archive_version, now=now,
+        )
+    return saved, duplicates
+
+
+def reselect_from_archive(
+    pool: List[PoolEntry],
+    diagnostics: Dict[str, Any],
+    now: datetime.datetime,
+    *,
+    storage: Optional[TrackingStorage] = None,
+    analytics_storage: Optional[AnalyticsStorage] = None,
+) -> Tuple[List[str], List[PoolEntry], int, int]:
+    """The entry point bot.py uses on every later button press within
+    the same Yekaterinburg calendar day: re-selects from the already
+    persisted pool for `now` (no network calls at all) and persists any
+    newly-eligible picks to tracking/analytics. Opens its own storage
+    here rather than making callers (bot.py in particular) import
+    tracking/ directly -- see tests/test_tracking_bot_isolation.py, which
+    forbids bot.py from importing tracking at all."""
+    owns_storage = storage is None
+    storage = storage or TrackingStorage()
+    owns_analytics_storage = analytics_storage is None
+    analytics_storage = analytics_storage or AnalyticsStorage(now=now)
+    try:
+        messages, selected_entries = select_and_render(
+            pool, now,
+            found_fixtures=diagnostics.get("found_fixtures", 0),
+            analysed_fixtures=diagnostics.get("analysed_fixtures", 0),
+            matched_fixtures=diagnostics.get("matched_fixtures"),
+            excluded_no_real_odds_count=diagnostics.get("excluded_no_real_odds_count", 0),
+        )
+        saved, duplicates = persist_selected(selected_entries, storage, analytics_storage, now)
+        return messages, selected_entries, saved, duplicates
+    finally:
+        if owns_storage:
+            storage.close()
+        if owns_analytics_storage:
+            analytics_storage.close()
 
 
 @dataclass
 class DailyArchive:
-    """A previously computed daily result, replayed verbatim on later
-    button presses within the same Yekaterinburg calendar day -- zero
-    recomputation, zero API-Football calls."""
-    messages: List[str]
+    """The full real, odds-backed candidate pool computed for THIS
+    Yekaterinburg calendar day (2026-07-15 change), replayed and
+    RE-SELECTED against the current moment on every later button press
+    within the same day -- zero API-Football/Odds API calls, but the
+    actual recommendations shown can differ from the first request if
+    some fixtures are no longer startable (see select_and_render)."""
+    pool: List[PoolEntry]
     diagnostics: Dict[str, Any]
     generated_at: datetime.datetime
     is_stale_calendar_day: bool = False
@@ -208,8 +400,17 @@ def load_daily_archive(
         "same_calendar_day" if same_day else "stale_calendar_day_explicitly_allowed",
         archive_date, now_date, generated_at.isoformat(), ignore_ttl,
     )
+    raw_pool = payload.get("pool", [])
+    try:
+        pool = [_deserialize_pool_entry(entry) for entry in raw_pool]
+    except (KeyError, ValueError, TypeError):
+        logger.warning(
+            "daily_archive.pool_unparsable now_local_date=%s site=football_pipeline.load_daily_archive",
+            now_date,
+        )
+        pool = []
     return DailyArchive(
-        messages=payload["messages"],
+        pool=pool,
         diagnostics=payload.get("diagnostics", {}),
         generated_at=generated_at,
         is_stale_calendar_day=not same_day,
@@ -236,12 +437,12 @@ def save_daily_archive(football_cache: FootballCache, result: "FootballPipelineR
         "source": "новый запрос",
     }
     logger.info(
-        "daily_archive.saved now_local_date=%s generated_at_utc=%s recommendations_count=%s "
+        "daily_archive.saved now_local_date=%s generated_at_utc=%s recommendations_count=%s pool_size=%s "
         "site=football_pipeline.save_daily_archive",
-        local_date_str(now), now.isoformat(), result.recommendations_count,
+        local_date_str(now), now.isoformat(), result.recommendations_count, len(result.pool),
     )
     football_cache.set(DAILY_ARCHIVE_KEY, {
-        "messages": result.telegram_messages,
+        "pool": [_serialize_pool_entry(entry) for entry in result.pool],
         "diagnostics": diagnostics,
         "generated_at": now.isoformat(),
     })
@@ -416,10 +617,15 @@ def run_football_predictions(
     result.api_football_requests_remaining = football_cache.requests_available()
     result.api_football_requests_used_today = football_cache.requests_used_today()
 
-    candidate_recommendations = select_recommendations(all_candidates)
+    # Rank EVERY analysed fixture that clears the probability threshold --
+    # deliberately NOT sliced to 5 here (2026-07-15 change): the daily
+    # archive persists this whole pool so a later request, once some of
+    # today's picks have already kicked off, can still re-select fresh
+    # real candidates from what remains without spending quota again.
+    full_ranked = rank_all_candidates(all_candidates)
 
     fixture_market_keys = {
-        rec.candidate.fixture.fixture_id: rec.candidate.market_key for rec in candidate_recommendations
+        rec.candidate.fixture.fixture_id: rec.candidate.market_key for rec in full_ranked
     }
     try:
         odds_result = attach_prices_from_matches(match_result.matches, fixture_market_keys)
@@ -428,19 +634,19 @@ def run_football_predictions(
     result.odds_by_fixture = odds_result.prices_by_fixture
     result.bookmaker_by_fixture = odds_result.bookmaker_by_fixture
 
-    # Mandatory real-odds gate: a recommendation is only ever shown, saved
-    # or recorded when a real bookmaker actually quotes that exact event
-    # and market right now. No placeholder/estimated coefficient is ever
-    # substituted -- a candidate with no real, matched price is dropped
-    # here, before rendering, storage or analytics ever see it.
-    pre_odds_filter_count = len(candidate_recommendations)
-    ranked = [
-        rec for rec in candidate_recommendations
-        if rec.candidate.fixture.fixture_id in odds_result.prices_by_fixture
+    # Mandatory real-odds gate: a candidate only ever enters the pool (and
+    # can therefore ever be shown, saved or recorded) when a real
+    # bookmaker actually quotes that exact event and market right now. No
+    # placeholder/estimated coefficient is ever substituted -- a candidate
+    # with no real, matched price is dropped here, before it ever reaches
+    # the pool, rendering, storage or analytics.
+    pool: List[PoolEntry] = [
+        (rec, odds_result.prices_by_fixture[fid], odds_result.bookmaker_by_fixture.get(fid, "?"))
+        for rec in full_ranked
+        if (fid := rec.candidate.fixture.fixture_id) in odds_result.prices_by_fixture
     ]
-    result.recommendations = ranked
-    result.recommendations_count = len(ranked)
-    result.excluded_no_real_odds_count = pre_odds_filter_count - len(ranked)
+    result.pool = pool
+    result.excluded_no_real_odds_count = len(full_ranked) - len(pool)
     if result.excluded_no_real_odds_count:
         logger.info(
             "football_pipeline.recommendations_excluded_no_real_odds count=%d "
@@ -449,35 +655,20 @@ def run_football_predictions(
             result.excluded_no_real_odds_count,
         )
 
-    odds_and_bookmaker_by_fixture = {
-        fid: (price, odds_result.bookmaker_by_fixture.get(fid, "?"))
-        for fid, price in odds_result.prices_by_fixture.items()
-    }
-    result.telegram_messages = render_predictions_message(
-        ranked, odds_and_bookmaker_by_fixture,
+    # This run's own initial request-time selection from the freshly
+    # built pool -- exactly the same re-selection logic a later button
+    # press against the archived pool will use (see select_and_render).
+    messages, selected_entries = select_and_render(
+        pool, now,
         found_fixtures=result.found_fixtures, analysed_fixtures=result.analysed_fixtures,
-        candidates_without_odds=result.excluded_no_real_odds_count,
         matched_fixtures=result.matched_fixtures,
+        excluded_no_real_odds_count=result.excluded_no_real_odds_count,
     )
+    result.telegram_messages = messages
+    result.recommendations = [entry[0] for entry in selected_entries]
+    result.recommendations_count = len(selected_entries)
 
-    archive_version = now.date().isoformat()
-    saved, duplicates = 0, 0
-    for rec in ranked:
-        odds = result.odds_by_fixture[rec.candidate.fixture.fixture_id]
-        prediction = _recommendation_to_prediction(rec, odds)
-        try:
-            storage.save_prediction(prediction)
-            saved += 1
-        except DuplicatePredictionError:
-            duplicates += 1
-        # Permanent analytics recording (see analytics/ package) -- never
-        # allowed to affect the real save/duplicate counters above, and
-        # never allowed to raise: a failure here must not break Telegram
-        # delivery of the recommendations that were already computed.
-        record_recommendation(
-            analytics_storage, rec, odds,
-            model_version=FOOTBALL_PIPELINE_MODEL_VERSION, archive_version=archive_version, now=now,
-        )
+    saved, duplicates = persist_selected(selected_entries, storage, analytics_storage, now)
     result.saved_count = saved
     result.duplicate_count = duplicates
 

@@ -98,6 +98,22 @@ OUTLIER_DEMOTES_BY_ONE_LEVEL = True
 #: weaker candidates just to reach this number.
 MAX_TOTAL_SIGNALS = 5
 
+# ---------------------------------------------------------------------------
+# Request-time re-selection (2026-07-15 change): a request no longer
+# replays a fixed top-5 computed once for a static 36h window. Every
+# request re-filters the already-discovered candidate pool against the
+# CURRENT moment -- matches that have already kicked off or finished are
+# dropped, and only what remains is (re-)ranked. See
+# ai_predictions/prediction_selector.select_current_recommendations and
+# .agents/memory/request-time-reselection.md.
+# ---------------------------------------------------------------------------
+
+#: A fixture is only eligible to be shown if its real kickoff is at least
+#: this many minutes in the future -- gives a user time to actually place
+#: a bet before the match starts, rather than showing something that is
+#: technically "not started yet" but seconds away.
+MIN_LEAD_TIME_MINUTES = 30
+
 #: Ranking-score weights (see value_engine.compute_ranking_score for the
 #: exact formula). All real, observable inputs -- EV, edge, bookmaker
 #: count, price dispersion, outlier penalty -- nothing about the score

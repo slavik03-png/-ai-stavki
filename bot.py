@@ -40,6 +40,7 @@ from ai_predictions.football_pipeline import (
     is_refresh_in_progress,
     load_daily_archive,
     mark_refresh_in_progress,
+    reselect_from_archive,
     run_football_predictions,
     save_daily_archive,
 )
@@ -404,21 +405,41 @@ def _format_archive_header(generated_at: datetime, *, stale: bool = False) -> st
     return f"💾 {label}\nОбновлено: {when}"
 
 
-async def _reply_archive(query, archive: DailyArchive, *, stale: bool = False) -> None:
+async def _reply_from_pool(query, archive: DailyArchive, now_dt: datetime, *, stale: bool = False) -> dict:
+    """Re-selects from the archived pool for the CURRENT moment (2026-07-15
+    change) instead of replaying a static message: excludes fixtures that
+    already started/finished or start within the minimum lead time, keeps
+    the best up-to-5 of whatever real candidates remain, and persists any
+    newly-eligible pick to tracking/analytics -- all pure CPU, zero
+    API-Football/Odds API calls. Returns the diagnostics dict to cache for
+    /status, with `recommendations_count` reflecting THIS re-selection."""
+    messages, selected_entries, saved, duplicates = await asyncio.to_thread(
+        reselect_from_archive, archive.pool, archive.diagnostics, now_dt,
+    )
     header = _format_archive_header(archive.generated_at, stale=stale)
-    messages = archive.messages or ["На ближайшие 36 часов подходящих сигналов не найдено."]
+    messages = messages or ["На ближайшие 36 часов подходящих сигналов не найдено."]
     await query.message.reply_text(header + "\n\n" + messages[0], reply_markup=main_keyboard())
     for extra in messages[1:]:
         await query.message.reply_text(extra, reply_markup=main_keyboard())
+    return {
+        **archive.diagnostics,
+        "recommendations_count": len(selected_entries),
+        "saved_count": saved,
+        "duplicate_count": duplicates,
+        "source": "архив",
+    }
 
 
 async def handle_ai_predictions(query, *, force_refresh: bool = False) -> None:
     """Strict daily archive: the first successful run of the (rolling)
-    24h window computes and persists the top-5 result once; every later
-    press within that window -- from any process, even across a bot
-    restart -- replays the saved archive verbatim and never calls
-    API-Football again. `force_refresh=True` is only ever passed from the
-    admin-confirmed /refresh_data flow."""
+    24h window computes and persists the FULL real, odds-backed candidate
+    pool once (2026-07-15 change); every later press within that window
+    -- from any process, even across a bot restart -- re-selects the best
+    still-startable picks from that SAME pool for the current moment
+    (never calling API-Football/The Odds API again), so matches that have
+    already kicked off are dropped and, if any real candidates remain,
+    fresh ones automatically take their place. `force_refresh=True` is
+    only ever passed from the admin-confirmed /refresh_data flow."""
     global ai_predictions_cache, ai_predictions_last_diagnostics, ai_predictions_last_success_ts
 
     # API-Football is the only REQUIRED key -- The Odds API is optional
@@ -437,14 +458,13 @@ async def handle_ai_predictions(query, *, force_refresh: bool = False) -> None:
             archive = load_daily_archive(football_cache, now_dt)
             if archive is not None:
                 ai_predictions_cache = {"archive": archive}
-                ai_predictions_last_diagnostics = {**archive.diagnostics, "source": "архив"}
-                await _reply_archive(query, archive)
+                ai_predictions_last_diagnostics = await _reply_from_pool(query, archive, now_dt)
                 return
 
         if ai_predictions_lock.locked() or is_refresh_in_progress(football_cache, now_dt):
             stale = load_daily_archive(football_cache, now_dt, ignore_ttl=True)
             if stale is not None:
-                await _reply_archive(query, stale, stale=True)
+                await _reply_from_pool(query, stale, now_dt, stale=True)
             else:
                 await query.message.reply_text(
                     "⏳ Архив данных уже формируется. Подожди немного и нажми кнопку снова.",
@@ -459,8 +479,7 @@ async def handle_ai_predictions(query, *, force_refresh: bool = False) -> None:
                 archive = load_daily_archive(football_cache, now_dt)
                 if archive is not None:
                     ai_predictions_cache = {"archive": archive}
-                    ai_predictions_last_diagnostics = {**archive.diagnostics, "source": "архив"}
-                    await _reply_archive(query, archive)
+                    ai_predictions_last_diagnostics = await _reply_from_pool(query, archive, now_dt)
                     return
 
             mark_refresh_in_progress(football_cache, now_dt)

@@ -13,16 +13,47 @@ never reads or writes the real production cache.
 """
 
 import asyncio
+import datetime
 import sys
 import tempfile
 from unittest.mock import AsyncMock, MagicMock
 
 sys.path.insert(0, ".")
 import bot
+from ai_predictions.fixtures import Fixture
 from ai_predictions.football_cache import FootballCache
 from ai_predictions.football_pipeline import FootballPipelineResult
+from ai_predictions.football_predictions import MarketCandidate
+from ai_predictions.prediction_selector import RankedRecommendation
 
 results = []
+
+
+def fake_pool(count=1, *, home_team="Команда А", away_team="Команда Б", lead_hours=3.0):
+    """Builds `count` real-shaped pool entries (2026-07-15 pool-based
+    archive redesign) -- the daily archive now re-selects/re-renders from
+    this pool on every request rather than replaying a fixed message, so
+    tests must give it real Fixture/MarketCandidate objects with a
+    kickoff comfortably past MIN_LEAD_TIME_MINUTES, not just a canned
+    string."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    pool = []
+    for i in range(count):
+        fixture = Fixture(
+            fixture_id=1000 + i,
+            kickoff_utc=now + datetime.timedelta(hours=lead_hours, minutes=i),
+            home_team=home_team, away_team=away_team,
+            home_team_id=1, away_team_id=2,
+            league_name="Test League", league_country="World", status_short="NS",
+        )
+        candidate = MarketCandidate(
+            fixture=fixture, market_key="h2h_home", market_label_ru="Победа хозяев",
+            probability=0.65, completeness=1.0, sample_size_category="full",
+            rationale="test rationale", source="recent_form",
+        )
+        rec = RankedRecommendation(candidate=candidate, signal_level="HIGH")
+        pool.append((rec, 1.85, "TestBookmaker"))
+    return pool
 
 
 def check(name, cond, detail=""):
@@ -53,7 +84,10 @@ def fake_result(
     messages=None, found=5, analysed=3, recs=1,
     used=6, remaining=80, used_today=20, odds_status="quota_exhausted", errors=None,
     odds_api_sports_queried=0, odds_api_credits_remaining=None, odds_api_last_request_at=None,
+    pool=None, home_team="Команда А", away_team="Команда Б",
 ):
+    if pool is None:
+        pool = fake_pool(recs, home_team=home_team, away_team=away_team) if recs else []
     return FootballPipelineResult(
         telegram_messages=messages or ["🤖 Прогноз готов"],
         found_fixtures=found, analysed_fixtures=analysed, fully_stat_fixtures=analysed, recommendations_count=recs,
@@ -63,6 +97,7 @@ def fake_result(
         odds_api_sports_queried=odds_api_sports_queried,
         odds_api_credits_remaining=odds_api_credits_remaining,
         odds_api_last_request_at=odds_api_last_request_at,
+        pool=pool,
     )
 
 
@@ -121,17 +156,22 @@ async def main():
     # the SAME db file simulates that). --------------------------------
     same_db_factory_path = tempfile.mktemp()
     bot._open_football_cache = lambda now: FootballCache(db_path=same_db_factory_path, now=now)
-    bot.run_football_predictions = lambda *a, **kw: fake_result(messages=["🤖 Первый прогон"])
+    bot.run_football_predictions = lambda *a, **kw: fake_result(home_team="Первый Клуб", away_team="Второй Клуб")
     update, query = make_callback_update(bot.AI_PREDICTIONS_PREFIX)
     await bot.handle_callback(update, ctx)
     check("archive is populated on first press against this db",
-          any("Первый прогон" in str(c) for c in query.message.reply_text.call_args_list))
+          any("Прогноз готов" in str(c) for c in query.message.reply_text.call_args_list))
 
+    # Second press: no recompute (run_football_predictions would raise),
+    # but re-selection from the SAME persisted pool (2026-07-15 change)
+    # still surfaces the same real candidate, since its kickoff is well
+    # beyond MIN_LEAD_TIME_MINUTES from "now" -- proving the archive was
+    # reused, not a static message replayed verbatim.
     bot.run_football_predictions = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not recompute from the persisted archive"))
     update, query = make_callback_update(bot.AI_PREDICTIONS_PREFIX)
     await bot.handle_callback(update, ctx)
     archive_reply_text = "\n".join(str(c) for c in query.message.reply_text.call_args_list)
-    check("archived response served without recomputation", "Первый прогон" in archive_reply_text, archive_reply_text)
+    check("archived response served without recomputation", "Первый Клуб" in archive_reply_text, archive_reply_text)
     check("archived response is labelled as coming from the daily archive", "суточного архива" in archive_reply_text)
 
     bot.run_football_predictions = original_run

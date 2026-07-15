@@ -15,3 +15,4 @@
 - [Display selection vs canonical settlement token](display-vs-canonical-selection.md) — also covers market_key vs tracking.settlement's market_type mismatch; analytics/ works around it with its own MARKET_KEY_MAP adapter.
 - [Bookmaker coverage & real-odds gating](bookmaker-coverage-and-odds-gating.md) — Зенит/Melbet/Fonbet/Winline have no real API coverage found; predictions without a real matched bookmaker price are now dropped entirely, never placeholdered.
 - [Country/confederation display fallback](country-confederation-fallback.md) — API-Football's country="World" for continental cups is real; use confederation-name fallback (display_country_ru) before "Мир", never a per-match guess.
+- [Request-time re-selection from a persisted pool](request-time-reselection.md) — daily archive stores the full ranked pool, not a fixed message; every request re-filters by current time + lead-time buffer before showing/saving.

@@ -13,10 +13,33 @@ from unittest.mock import AsyncMock, MagicMock
 
 sys.path.insert(0, ".")
 import bot
+from ai_predictions.fixtures import Fixture
 from ai_predictions.football_cache import FootballCache
-from ai_predictions.football_pipeline import FootballPipelineResult
+from ai_predictions.football_pipeline import FootballPipelineResult, select_and_render
+from ai_predictions.football_predictions import MarketCandidate
+from ai_predictions.prediction_selector import RankedRecommendation
 
 results = []
+
+
+def fake_pool_entry(fixture_id, now, label):
+    """A real pool entry (2026-07-15 pool-based archive redesign) whose
+    home team name carries `label` so tests can tell which run's
+    candidate is being shown -- the archive re-renders from the pool on
+    every request rather than replaying a fixed string, so a plain
+    telegram_messages list is not enough to distinguish runs any more."""
+    fixture = Fixture(
+        fixture_id=fixture_id, kickoff_utc=now + datetime.timedelta(hours=3),
+        home_team=label, away_team="Соперник", home_team_id=1, away_team_id=2,
+        league_name="Test League", league_country="World", status_short="NS",
+    )
+    candidate = MarketCandidate(
+        fixture=fixture, market_key="h2h_home", market_label_ru="Победа хозяев",
+        probability=0.65, completeness=1.0, sample_size_category="full",
+        rationale="test", source="recent_form",
+    )
+    rec = RankedRecommendation(candidate=candidate, signal_level="HIGH")
+    return rec, 1.85, "TestBookmaker"
 
 
 def check(name, cond, detail=""):
@@ -63,9 +86,13 @@ async def main():
 
     def fake_run(*a, **kw):
         calls["count"] += 1
+        now = kw.get("now") or (a[1] if len(a) > 1 else evening_before)
         if calls["count"] == 1:
-            return FootballPipelineResult(telegram_messages=["🤖 Прогноз ЗА ВЧЕРА (14 июля)"], recommendations_count=1)
-        return FootballPipelineResult(telegram_messages=["🤖 Прогноз НА СЕГОДНЯ (15 июля)"], recommendations_count=2)
+            pool = [fake_pool_entry(1, now, "ЗА ВЧЕРА")]
+        else:
+            pool = [fake_pool_entry(2, now, "НА СЕГОДНЯ")]
+        messages, selected_entries = select_and_render(pool, now, found_fixtures=1, analysed_fixtures=1)
+        return FootballPipelineResult(pool=pool, telegram_messages=messages, recommendations_count=len(selected_entries))
 
     bot.run_football_predictions = fake_run
 

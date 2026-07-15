@@ -19,7 +19,7 @@ now_after_midnight = datetime.datetime(2026, 7, 14, 19, 10, tzinfo=datetime.time
 
 path = tempfile.mktemp()
 cache = FootballCache(db_path=path, now=generated_at)
-result = FootballPipelineResult(telegram_messages=["🤖 Прогноз за вчера"], recommendations_count=1)
+result = FootballPipelineResult(pool=[], recommendations_count=1)
 save_daily_archive(cache, result, generated_at)
 
 # Sanity: within the SAME calendar day, the archive must still be served.
@@ -49,10 +49,10 @@ print("PASS: /status diagnostics can still see it, correctly flagged as stale_ca
 
 # Now simulate the real fix path: a fresh run for the new day gets saved,
 # and immediately becomes the one served.
-new_result = FootballPipelineResult(telegram_messages=["🤖 Прогноз на сегодня"], recommendations_count=2)
+new_result = FootballPipelineResult(pool=[], recommendations_count=2)
 save_daily_archive(cache, new_result, now_after_midnight)
 fresh = load_daily_archive(cache, now_after_midnight)
-assert fresh is not None and fresh.messages == ["🤖 Прогноз на сегодня"]
+assert fresh is not None and fresh.diagnostics.get("recommendations_count") == 2
 print("PASS: a fresh same-day archive built after midnight is served correctly")
 
 cache.close()
