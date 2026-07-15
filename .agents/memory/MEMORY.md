@@ -16,3 +16,4 @@
 - [Bookmaker coverage & real-odds gating](bookmaker-coverage-and-odds-gating.md) — Зенит/Melbet/Fonbet/Winline have no real API coverage found; predictions without a real matched bookmaker price are now dropped entirely, never placeholdered.
 - [Country/confederation display fallback](country-confederation-fallback.md) — API-Football's country="World" for continental cups is real; use confederation-name fallback (display_country_ru) before "Мир", never a per-match guess.
 - [Request-time re-selection from a persisted pool](request-time-reselection.md) — daily archive stores the full ranked pool, not a fixed message; every request re-filters by current time + lead-time buffer before showing/saving.
+- [Per-user shown-tracking design](per-user-shown-tracking.md) — exclude_keys=None means legacy/non-per-user behaviour; passing football_cache+telegram_user_id together is the only signal for user-scoped re-selection.

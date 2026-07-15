@@ -58,6 +58,19 @@ NO_ODDS_EVENTS_TEMPLATE = (
 
 HEADING = "🤖 ПРОГНОЗЫ ИИ НА БЛИЖАЙШИЕ 36 ЧАСОВ"
 
+#: Exact required text (per-user shown-tracking & pool re-selection,
+#: 2026-07-15): shown whenever a specific Telegram user's re-selection
+#: from the shared daily pool yields zero eligible picks -- whether
+#: because every remaining real candidate has already been shown to THIS
+#: user earlier today, or because none are left with enough lead time.
+#: Sent standalone (no archive header, no generic no-signal template)
+#: since it already explains the situation in full.
+NOTHING_LEFT_FOR_USER_TEMPLATE = (
+    "На текущий момент новых прогнозов из суточного пула не осталось. "
+    "Утренний анализ сохранён, но все подходящие варианты уже были показаны или матчи начались. "
+    "Новый пул будет сформирован после следующего суточного обновления."
+)
+
 #: Shown once, after all cards, whenever at least one recommendation was
 #: produced -- never mixed into an individual card.
 DISCLAIMER = (
@@ -76,6 +89,10 @@ def render_no_odds_message(candidates_without_odds: int) -> str:
 
 def render_no_odds_events_message(found_fixtures: int) -> str:
     return NO_ODDS_EVENTS_TEMPLATE.format(count=found_fixtures)
+
+
+def render_nothing_left_for_user_message() -> str:
+    return NOTHING_LEFT_FOR_USER_TEMPLATE
 
 
 def _format_probability(probability: float) -> str:

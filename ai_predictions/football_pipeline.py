@@ -57,7 +57,10 @@ from ai_predictions.football_cache import FootballCache
 from ai_predictions.football_predictions import MarketCandidate, build_candidates_for_fixture
 from ai_predictions.odds_client import QUOTA_EXHAUSTED_MARKER, fetch_all_active_football_events
 from ai_predictions.odds_lookup import OddsLookupResult, attach_prices_from_matches
-from ai_predictions.prediction_report import render_predictions_message
+from ai_predictions.prediction_report import (
+    render_nothing_left_for_user_message,
+    render_predictions_message,
+)
 from ai_predictions.prediction_selector import (
     RankedRecommendation,
     rank_all_candidates,
@@ -232,6 +235,7 @@ def select_and_render(
     matched_fixtures: Optional[int] = None,
     excluded_no_real_odds_count: int = 0,
     min_lead_minutes: float = MIN_LEAD_TIME_MINUTES,
+    exclude_keys: Optional[set] = None,
 ) -> Tuple[List[str], List[PoolEntry]]:
     """The one place request-time re-selection happens (2026-07-15
     change): given the FULL persisted pool for the day and the CURRENT
@@ -239,11 +243,32 @@ def select_and_render(
     `min_lead_minutes`, keeps the best up-to-5 of whatever real
     candidates remain, and renders the exact card format for them. Pure
     CPU -- no network call, safe to call on every button press and from
-    /status-adjacent code paths."""
+    /status-adjacent code paths.
+
+    `exclude_keys` (per-user shown-tracking, 2026-07-15 change): when not
+    None, it is a set of (fixture_id, market_key) pairs already shown to
+    the REQUESTING user earlier today -- those pool entries are removed
+    before ranking/selection, on top of the time-based exclusion above.
+    Passing None (the default) means "no per-user tracking requested" and
+    preserves the exact prior behaviour/messages for callers that do not
+    pass a Telegram user id (e.g. older tests). Passing a set -- even an
+    empty one -- means this call IS user-scoped: if nothing real remains
+    after both exclusions, the honest "nothing left in today's pool for
+    you" message is returned instead of the generic no-signal templates,
+    which describe the original run and would be misleading here."""
     ranked = [entry[0] for entry in pool]
+    if exclude_keys is not None:
+        ranked = [
+            r for r in ranked
+            if (r.candidate.fixture.fixture_id, r.candidate.market_key) not in exclude_keys
+        ]
     selected_recs = select_current_recommendations(ranked, now, min_lead_minutes=min_lead_minutes)
     by_fixture_id = {entry[0].candidate.fixture.fixture_id: entry for entry in pool}
     selected_entries = [by_fixture_id[rec.candidate.fixture.fixture_id] for rec in selected_recs]
+
+    if not selected_recs and exclude_keys is not None:
+        return [render_nothing_left_for_user_message()], selected_entries
+
     odds_and_bookmaker_by_fixture = {
         fid: (odds, bookmaker) for fid, (_, odds, bookmaker) in
         ((entry[0].candidate.fixture.fixture_id, entry) for entry in selected_entries)
@@ -255,6 +280,32 @@ def select_and_render(
         matched_fixtures=matched_fixtures,
     )
     return messages, selected_entries
+
+
+def _shown_keys_for_user(
+    football_cache: Optional[FootballCache],
+    telegram_user_id: Optional[int],
+    now: datetime.datetime,
+) -> Optional[set]:
+    """None means "no per-user tracking for this call" (see
+    select_and_render's `exclude_keys` docstring) -- only when BOTH a
+    football_cache (the shown-picks store lives there) and a real
+    Telegram user id are available does this become user-scoped."""
+    if football_cache is None or telegram_user_id is None:
+        return None
+    return football_cache.get_shown_keys(local_date_str(now), telegram_user_id)
+
+
+def _mark_entries_shown(
+    football_cache: Optional[FootballCache],
+    telegram_user_id: Optional[int],
+    now: datetime.datetime,
+    selected_entries: List[PoolEntry],
+) -> None:
+    if football_cache is None or telegram_user_id is None or not selected_entries:
+        return
+    keys = [(rec.candidate.fixture.fixture_id, rec.candidate.market_key) for rec, _, _ in selected_entries]
+    football_cache.mark_shown(local_date_str(now), telegram_user_id, keys)
 
 
 def persist_selected(
@@ -293,6 +344,8 @@ def reselect_from_archive(
     *,
     storage: Optional[TrackingStorage] = None,
     analytics_storage: Optional[AnalyticsStorage] = None,
+    football_cache: Optional[FootballCache] = None,
+    telegram_user_id: Optional[int] = None,
 ) -> Tuple[List[str], List[PoolEntry], int, int]:
     """The entry point bot.py uses on every later button press within
     the same Yekaterinburg calendar day: re-selects from the already
@@ -300,20 +353,30 @@ def reselect_from_archive(
     newly-eligible picks to tracking/analytics. Opens its own storage
     here rather than making callers (bot.py in particular) import
     tracking/ directly -- see tests/test_tracking_bot_isolation.py, which
-    forbids bot.py from importing tracking at all."""
+    forbids bot.py from importing tracking at all.
+
+    `football_cache` + `telegram_user_id` (per-user shown-tracking,
+    2026-07-15 change): when both are given, this call excludes any pick
+    already shown to THIS Telegram user earlier today (on top of the
+    existing time-based exclusion) and marks whatever is newly selected
+    as shown for them right after. Passing neither preserves the exact
+    prior (non-per-user) behaviour."""
     owns_storage = storage is None
     storage = storage or TrackingStorage()
     owns_analytics_storage = analytics_storage is None
     analytics_storage = analytics_storage or AnalyticsStorage(now=now)
     try:
+        exclude_keys = _shown_keys_for_user(football_cache, telegram_user_id, now)
         messages, selected_entries = select_and_render(
             pool, now,
             found_fixtures=diagnostics.get("found_fixtures", 0),
             analysed_fixtures=diagnostics.get("analysed_fixtures", 0),
             matched_fixtures=diagnostics.get("matched_fixtures"),
             excluded_no_real_odds_count=diagnostics.get("excluded_no_real_odds_count", 0),
+            exclude_keys=exclude_keys,
         )
         saved, duplicates = persist_selected(selected_entries, storage, analytics_storage, now)
+        _mark_entries_shown(football_cache, telegram_user_id, now, selected_entries)
         return messages, selected_entries, saved, duplicates
     finally:
         if owns_storage:
@@ -509,6 +572,7 @@ def run_football_predictions(
     max_fixtures_analysed: int = MAX_FIXTURES_ANALYSED_PER_RUN,
     football_cache: Optional[FootballCache] = None,
     analytics_storage: Optional[AnalyticsStorage] = None,
+    telegram_user_id: Optional[int] = None,
 ) -> FootballPipelineResult:
     now = now or datetime.datetime.now(datetime.timezone.utc)
     if football_api_key is _UNSET:
@@ -658,11 +722,13 @@ def run_football_predictions(
     # This run's own initial request-time selection from the freshly
     # built pool -- exactly the same re-selection logic a later button
     # press against the archived pool will use (see select_and_render).
+    exclude_keys = _shown_keys_for_user(football_cache, telegram_user_id, now)
     messages, selected_entries = select_and_render(
         pool, now,
         found_fixtures=result.found_fixtures, analysed_fixtures=result.analysed_fixtures,
         matched_fixtures=result.matched_fixtures,
         excluded_no_real_odds_count=result.excluded_no_real_odds_count,
+        exclude_keys=exclude_keys,
     )
     result.telegram_messages = messages
     result.recommendations = [entry[0] for entry in selected_entries]
@@ -671,6 +737,7 @@ def run_football_predictions(
     saved, duplicates = persist_selected(selected_entries, storage, analytics_storage, now)
     result.saved_count = saved
     result.duplicate_count = duplicates
+    _mark_entries_shown(football_cache, telegram_user_id, now, selected_entries)
 
     if owns_storage:
         storage.close()

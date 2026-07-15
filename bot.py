@@ -44,8 +44,9 @@ from ai_predictions.football_pipeline import (
     run_football_predictions,
     save_daily_archive,
 )
+from ai_predictions.prediction_report import render_nothing_left_for_user_message
 from ai_predictions.value_config import DAILY_ARCHIVE_TTL_HOURS
-from ai_predictions.window import format_user_time
+from ai_predictions.window import format_user_time, local_date_str
 
 # The AI Betting Analytics module (analytics/) is a new, independent
 # top-level package -- like ai_predictions/, it is fine for bot.py to
@@ -405,22 +406,33 @@ def _format_archive_header(generated_at: datetime, *, stale: bool = False) -> st
     return f"💾 {label}\nОбновлено: {when}"
 
 
-async def _reply_from_pool(query, archive: DailyArchive, now_dt: datetime, *, stale: bool = False) -> dict:
+async def _reply_from_pool(
+    query, archive: DailyArchive, now_dt: datetime, football_cache: FootballCache,
+    telegram_user_id: Optional[int], *, stale: bool = False,
+) -> dict:
     """Re-selects from the archived pool for the CURRENT moment (2026-07-15
     change) instead of replaying a static message: excludes fixtures that
-    already started/finished or start within the minimum lead time, keeps
-    the best up-to-5 of whatever real candidates remain, and persists any
-    newly-eligible pick to tracking/analytics -- all pure CPU, zero
+    already started/finished, start within the minimum lead time, or were
+    already shown to THIS Telegram user earlier today (per-user
+    shown-tracking, same-day change), keeps the best up-to-5 of whatever
+    real candidates remain, and persists any newly-eligible pick to
+    tracking/analytics + this user's shown-history -- all pure CPU, zero
     API-Football/Odds API calls. Returns the diagnostics dict to cache for
     /status, with `recommendations_count` reflecting THIS re-selection."""
     messages, selected_entries, saved, duplicates = await asyncio.to_thread(
         reselect_from_archive, archive.pool, archive.diagnostics, now_dt,
+        football_cache=football_cache, telegram_user_id=telegram_user_id,
     )
-    header = _format_archive_header(archive.generated_at, stale=stale)
     messages = messages or ["На ближайшие 36 часов подходящих сигналов не найдено."]
-    await query.message.reply_text(header + "\n\n" + messages[0], reply_markup=main_keyboard())
-    for extra in messages[1:]:
-        await query.message.reply_text(extra, reply_markup=main_keyboard())
+    if not selected_entries and messages == [render_nothing_left_for_user_message()]:
+        # Exact required text, sent standalone -- no archive header, it
+        # already explains the situation in full.
+        await query.message.reply_text(messages[0], reply_markup=main_keyboard())
+    else:
+        header = _format_archive_header(archive.generated_at, stale=stale)
+        await query.message.reply_text(header + "\n\n" + messages[0], reply_markup=main_keyboard())
+        for extra in messages[1:]:
+            await query.message.reply_text(extra, reply_markup=main_keyboard())
     return {
         **archive.diagnostics,
         "recommendations_count": len(selected_entries),
@@ -451,6 +463,8 @@ async def handle_ai_predictions(query, *, force_refresh: bool = False) -> None:
         )
         return
 
+    telegram_user_id = query.from_user.id if query.from_user else None
+
     now_dt = datetime.now(timezone.utc)
     football_cache = _open_football_cache(now_dt)
     try:
@@ -458,13 +472,15 @@ async def handle_ai_predictions(query, *, force_refresh: bool = False) -> None:
             archive = load_daily_archive(football_cache, now_dt)
             if archive is not None:
                 ai_predictions_cache = {"archive": archive}
-                ai_predictions_last_diagnostics = await _reply_from_pool(query, archive, now_dt)
+                ai_predictions_last_diagnostics = await _reply_from_pool(
+                    query, archive, now_dt, football_cache, telegram_user_id,
+                )
                 return
 
         if ai_predictions_lock.locked() or is_refresh_in_progress(football_cache, now_dt):
             stale = load_daily_archive(football_cache, now_dt, ignore_ttl=True)
             if stale is not None:
-                await _reply_from_pool(query, stale, now_dt, stale=True)
+                await _reply_from_pool(query, stale, now_dt, football_cache, telegram_user_id, stale=True)
             else:
                 await query.message.reply_text(
                     "⏳ Архив данных уже формируется. Подожди немного и нажми кнопку снова.",
@@ -479,7 +495,9 @@ async def handle_ai_predictions(query, *, force_refresh: bool = False) -> None:
                 archive = load_daily_archive(football_cache, now_dt)
                 if archive is not None:
                     ai_predictions_cache = {"archive": archive}
-                    ai_predictions_last_diagnostics = await _reply_from_pool(query, archive, now_dt)
+                    ai_predictions_last_diagnostics = await _reply_from_pool(
+                        query, archive, now_dt, football_cache, telegram_user_id,
+                    )
                     return
 
             mark_refresh_in_progress(football_cache, now_dt)
@@ -491,7 +509,8 @@ async def handle_ai_predictions(query, *, force_refresh: bool = False) -> None:
             await query.message.reply_text(intro)
             try:
                 result = await asyncio.to_thread(
-                    run_football_predictions, football_cache=football_cache, now=now_dt,
+                    run_football_predictions,
+                    football_cache=football_cache, now=now_dt, telegram_user_id=telegram_user_id,
                 )
                 messages = result.telegram_messages or ["На ближайшие 36 часов подходящих сигналов не найдено."]
                 save_daily_archive(football_cache, result, now_dt)
@@ -540,6 +559,31 @@ async def handle_ai_predictions(query, *, force_refresh: bool = False) -> None:
                 await query.message.reply_text(f"❌ Ошибка при формировании прогнозов ИИ: {e}", reply_markup=main_keyboard())
     finally:
         football_cache.close()
+
+
+async def reset_shown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/reset_shown -- admin-only. Clears only the CALLING admin's own
+    per-user shown-history for the current Yekaterinburg calendar day, so
+    they can re-verify the "🤖 Прогнозы ИИ" re-selection flow without
+    waiting for the next daily update. Never touches the shared daily
+    pool, tracking, or analytics data -- only the shown_picks rows for
+    (today, this admin's Telegram id)."""
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id not in ADMIN_TELEGRAM_IDS:
+        await update.message.reply_text("⛔ Эта команда доступна только администратору.")
+        return
+
+    now_dt = datetime.now(timezone.utc)
+    football_cache = _open_football_cache(now_dt)
+    try:
+        cleared = football_cache.clear_shown_for_user(local_date_str(now_dt), user_id)
+    finally:
+        football_cache.close()
+
+    await update.message.reply_text(
+        f"✅ Ваша история показанных сегодня прогнозов очищена (записей удалено: {cleared}). "
+        "Общий суточный пул и статистика не затронуты."
+    )
 
 
 def _format_ago(now_dt: datetime, then_dt: datetime) -> str:
@@ -773,6 +817,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("refresh_data", refresh_data_command))
+    app.add_handler(CommandHandler("reset_shown", reset_shown_command))
     app.add_handler(CommandHandler("admin_report", admin_report_command))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.post_init = _post_init

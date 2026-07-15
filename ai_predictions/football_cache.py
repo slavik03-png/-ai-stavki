@@ -67,6 +67,27 @@ class FootballCache:
                 )
                 """
             )
+            # Per-user shown-tracking (2026-07-15): which real picks from
+            # the shared daily pool have already been shown to a SPECIFIC
+            # Telegram user on a given Yekaterinburg calendar day, so a
+            # later re-selection for that same user can exclude them and
+            # surface the next-best remaining candidates instead of
+            # repeating one already seen. Shared across all users (the
+            # pool itself lives elsewhere, in the daily-archive cache
+            # entry) -- this table only ever records "user X has seen
+            # fixture Y / market Z today", nothing about the pool itself.
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS shown_picks (
+                    local_date TEXT NOT NULL,
+                    telegram_user_id INTEGER NOT NULL,
+                    fixture_id INTEGER NOT NULL,
+                    market_key TEXT NOT NULL,
+                    shown_at TEXT NOT NULL,
+                    PRIMARY KEY (local_date, telegram_user_id, fixture_id, market_key)
+                )
+                """
+            )
 
     def close(self) -> None:
         self._conn.close()
@@ -145,6 +166,49 @@ class FootballCache:
 
     def can_spend(self, count: int = 1) -> bool:
         return self.requests_available() >= count
+
+    # -- per-user shown-tracking -----------------------------------------
+
+    def get_shown_keys(self, local_date: str, telegram_user_id: int) -> set:
+        """Returns the set of (fixture_id, market_key) pairs already shown
+        to this Telegram user on this Yekaterinburg calendar date."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT fixture_id, market_key FROM shown_picks "
+                "WHERE local_date = ? AND telegram_user_id = ?",
+                (local_date, telegram_user_id),
+            ).fetchall()
+        return {(fixture_id, market_key) for fixture_id, market_key in rows}
+
+    def mark_shown(self, local_date: str, telegram_user_id: int, entries) -> None:
+        """Records each (fixture_id, market_key) pair in `entries` as shown
+        to this user on this date. Idempotent -- a pick shown again (e.g.
+        it is still eligible on a later press before this table is
+        consulted) is never duplicated or double-recorded."""
+        entries = list(entries)
+        if not entries:
+            return
+        with self._lock, self._conn:
+            for fixture_id, market_key in entries:
+                self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO shown_picks
+                        (local_date, telegram_user_id, fixture_id, market_key, shown_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (local_date, telegram_user_id, fixture_id, market_key, self._now.isoformat()),
+                )
+
+    def clear_shown_for_user(self, local_date: str, telegram_user_id: int) -> int:
+        """Deletes only this user's shown-history for this date (never the
+        shared pool, tracking, or analytics data). Returns how many rows
+        were cleared, for an honest confirmation reply."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM shown_picks WHERE local_date = ? AND telegram_user_id = ?",
+                (local_date, telegram_user_id),
+            )
+            return cur.rowcount
 
     def record_requests(self, count: int) -> None:
         if count <= 0:
