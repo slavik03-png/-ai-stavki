@@ -20,9 +20,15 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Tuple
 
 from ai_predictions.prediction_selector import RankedRecommendation
-from ai_predictions.ru_translation import country_ru, league_ru, team_ru
+from ai_predictions.ru_translation import display_country_ru, league_ru, team_ru
 from ai_predictions.value_config import SIGNAL_EMOJI_RU_CARD, SIGNAL_WORD_RU_CARD
 from ai_predictions.window import format_card_time
+
+#: This pipeline (ai_predictions/football_pipeline.py) is football-only --
+#: see ai_predictions/__init__.py's module docstring. The label is kept as
+#: a constant, not hardcoded inline, so a future sport-specific pipeline
+#: only needs to pass its own label rather than change the card layout.
+SPORT_LABEL_RU = "⚽ Футбол"
 
 NO_SIGNAL_TEMPLATE = (
     "На ближайшие 36 часов найдено {count} матчей, но ни один вариант не достиг "
@@ -123,7 +129,7 @@ def render_recommendation_card(
     fixture = c.fixture
     emoji = SIGNAL_EMOJI_RU_CARD[recommendation.signal_level]
     word = SIGNAL_WORD_RU_CARD[recommendation.signal_level]
-    country = country_ru(fixture.league_country) or "неизвестно"
+    country = display_country_ru(fixture.league_country, fixture.league_name)
     league = league_ru(fixture.league_name) or "неизвестно"
     home = team_ru(fixture.home_team)
     away = team_ru(fixture.away_team)
@@ -132,6 +138,7 @@ def render_recommendation_card(
     lines = [
         f"⚽ ПРОГНОЗ №{index}",
         "",
+        f"Вид спорта: {SPORT_LABEL_RU}",
         f"🌍 Страна: {country}",
         f"🏆 Турнир: {league}",
         f"👥 Матч: {home} — {away}",

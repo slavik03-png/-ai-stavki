@@ -294,13 +294,15 @@ def test_card_format_and_no_technical_leakage():
 
     card = messages[1]
     for required in (
-        "⚽ ПРОГНОЗ №1", "🌍 Страна:", "🏆 Турнир:", "👥 Матч:", "🕒 Начало:",
+        "⚽ ПРОГНОЗ №1", "Вид спорта:", "🌍 Страна:", "🏆 Турнир:", "👥 Матч:", "🕒 Начало:",
         "🎯 Ставка:", "📊 Расчётная вероятность:", "💰 Коэффициент:",
         "Уровень сигнала:", "Краткое объяснение:",
     ):
         check(f"card contains '{required}'", required in card, card)
     check("card shows the real coefficient and the real bookmaker it came from",
           "Коэффициент: 1,85 (Pinnacle)" in card)
+    check("card shows the sport", "⚽ Футбол" in card)
+    check("card shows the real country (Brazil), not the generic 'Мир'", "Страна: Бразилия" in card)
     check("no 'нет данных' placeholder ever shown on a rendered card", "нет данных" not in card)
     check("card shows whole-percent probability", "68%" in card)
     check("signal level shown as a plain Russian word, not a raw code", "средний" in card and "MEDIUM" not in card)
@@ -359,6 +361,24 @@ def test_odds_formatted_with_russian_comma():
     card = render_recommendation_card(1, rec, 1.65, "1xBet")
     check("odds shown with a comma, not a dot", "1,65" in card and "1.65" not in card)
     check("real bookmaker name shown on the card", "1xBet" in card)
+
+
+def test_display_country_prefers_real_country_then_confederation_then_world():
+    from ai_predictions.ru_translation import display_country_ru
+    check("real country translated", display_country_ru("Japan", "J1 League") == "Япония")
+    check("real country translated (Brazil)", display_country_ru("Brazil", "Serie B") == "Бразилия")
+    check("UEFA competition with country=World falls back to Европа",
+          display_country_ru("World", "UEFA Champions League") == "Европа")
+    check("CAF competition with country=World falls back to Африка",
+          display_country_ru("World", "CAF Champions League") == "Африка")
+    check("AFC competition with country=World falls back to Азия",
+          display_country_ru("World", "AFC Champions League") == "Азия")
+    check("Copa Libertadores falls back to Южная Америка",
+          display_country_ru("World", "CONMEBOL Copa Libertadores") == "Южная Америка")
+    check("genuinely global competition (World Cup) keeps 'Мир' as last resort",
+          display_country_ru("World", "World Cup") == "Мир")
+    check("missing country and unrecognised competition also falls back to 'Мир'",
+          display_country_ru(None, "Some Unknown Cup") == "Мир")
 
 
 def test_utc_to_yekaterinburg_time_conversion():

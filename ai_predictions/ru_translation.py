@@ -122,11 +122,65 @@ def team_ru(name: Optional[str]) -> Optional[str]:
     return _TEAM_RU.get(key, name)
 
 
+#: Real, verified continental-confederation scope for competitions whose
+#: API-Football `country` field is "World" because they span many
+#: countries. Each key is a substring of the confederation's own name,
+#: which is always literally present in the competition's real name
+#: (e.g. "UEFA Champions League", "CAF Champions League") -- this is a
+#: real classification of a real organisation, never a per-match guess.
+#: FIFA/global competitions (World Cup, most Friendlies) have no single
+#: continent and correctly keep "Мир".
+_CONFEDERATION_REGION_RU = {
+    "uefa": "Европа",
+    "caf": "Африка",
+    "afc": "Азия",
+    "concacaf": "Северная и Центральная Америка",
+    "conmebol": "Южная Америка",
+    "copa libertadores": "Южная Америка",
+    "copa sudamericana": "Южная Америка",
+    "copa america": "Южная Америка",
+    "ofc": "Океания",
+}
+
+
+def tournament_region_ru(league_name: Optional[str]) -> Optional[str]:
+    """Best-effort continental fallback for a competition whose country
+    is unknown/"World" -- only returns a region when the competition's
+    own real name identifies a real confederation (see
+    `_CONFEDERATION_REGION_RU`); otherwise None (caller falls back to
+    "Мир")."""
+    if not league_name:
+        return None
+    name = league_name.strip().lower()
+    for key, region in _CONFEDERATION_REGION_RU.items():
+        if key in name:
+            return region
+    return None
+
+
 def country_ru(country: Optional[str]) -> Optional[str]:
     if not country:
         return country
     key = country.strip().lower().replace(" ", "-")
     return _COUNTRY_RU.get(key, country)
+
+
+def display_country_ru(league_country: Optional[str], league_name: Optional[str] = None) -> str:
+    """The country/region shown on a prediction card, in priority order:
+    1. the real country API-Football reports for the league, translated;
+    2. if that country is missing or literally "World" (a multi-country
+       competition), the real confederation running it, inferred from the
+       competition's own verified name (e.g. "UEFA ..." -> "Европа");
+    3. "Мир" only as the genuine last resort for truly global competitions
+       (FIFA World Cup, most international Friendlies) -- never a guess."""
+    if league_country:
+        key = league_country.strip().lower().replace(" ", "-")
+        if key not in ("world", ""):
+            return _COUNTRY_RU.get(key, league_country)
+    region = tournament_region_ru(league_name)
+    if region:
+        return region
+    return "Мир"
 
 
 def league_ru(league: Optional[str]) -> Optional[str]:
