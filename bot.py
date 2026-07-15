@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import csv
 import tempfile
@@ -6,6 +7,16 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 
 import requests
+
+# INFO-level logging is required so the daily-archive freshness decisions
+# logged by ai_predictions/football_pipeline.py (which calendar day the
+# archive vs "now" fall on, and why it was accepted/rejected/rebuilt) are
+# actually visible in the workflow console -- the root logger defaults to
+# WARNING otherwise and would silently swallow them.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
@@ -552,7 +563,10 @@ def build_status_text() -> str:
             football_cache = _open_football_cache(now_dt)
             requests_remaining_text = str(football_cache.requests_available())
             requests_used_today_text = str(football_cache.requests_used_today())
-            archive = load_daily_archive(football_cache, now_dt, ignore_ttl=True)
+            # /status is diagnostics-only and intentionally allowed to see
+            # a calendar-stale archive (to report it as such) -- it never
+            # presents it to the user as today's predictions.
+            archive = load_daily_archive(football_cache, now_dt, ignore_ttl=True, allow_stale_calendar_day=True)
             football_cache.close()
         except Exception:
             pass
@@ -560,8 +574,16 @@ def build_status_text() -> str:
     if archive is not None:
         archive_age_text = _format_ago(now_dt, archive.generated_at)
         last_update_text = format_user_time(archive.generated_at, now_dt)
-        is_fresh = (now_dt - archive.generated_at) <= timedelta(hours=DAILY_ARCHIVE_TTL_HOURS)
-        archive_state_text = "актуален" if is_fresh else "устарел (>24ч), будет обновлён при следующем запросе"
+        is_fresh = (
+            not archive.is_stale_calendar_day
+            and (now_dt - archive.generated_at) <= timedelta(hours=DAILY_ARCHIVE_TTL_HOURS)
+        )
+        if archive.is_stale_calendar_day:
+            archive_state_text = "устарел (другая календарная дата в Екатеринбурге), будет пересобран при следующем запросе"
+        elif is_fresh:
+            archive_state_text = "актуален"
+        else:
+            archive_state_text = "устарел (>24ч), будет обновлён при следующем запросе"
         d = archive.diagnostics
         found_text = str(d.get("found_fixtures", "неизвестно"))
         fully_stat_text = str(d.get("fully_stat_fixtures", "неизвестно"))

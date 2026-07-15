@@ -19,6 +19,7 @@ Pipeline:
 from __future__ import annotations
 
 import datetime
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -38,11 +39,14 @@ from ai_predictions.value_config import (
     SIGNAL_LOW,
     SIGNAL_MEDIUM,
 )
+from ai_predictions.window import is_same_local_day, local_date_str
 from tracking.models import STATUS_PENDING, Prediction
 from tracking.storage import DuplicatePredictionError, TrackingStorage
 
 from analytics.integration import record_recommendation
 from analytics.storage import AnalyticsStorage
+
+logger = logging.getLogger(__name__)
 
 FOOTBALL_PIPELINE_MODEL_VERSION = "football-predictions-v3"
 
@@ -87,30 +91,84 @@ class FootballPipelineResult:
 @dataclass
 class DailyArchive:
     """A previously computed daily result, replayed verbatim on later
-    button presses within the same 24h window -- zero recomputation, zero
-    API-Football calls."""
+    button presses within the same Yekaterinburg calendar day -- zero
+    recomputation, zero API-Football calls."""
     messages: List[str]
     diagnostics: Dict[str, Any]
     generated_at: datetime.datetime
+    is_stale_calendar_day: bool = False
 
 
 def load_daily_archive(
-    football_cache: FootballCache, now: datetime.datetime, *, ignore_ttl: bool = False,
+    football_cache: FootballCache,
+    now: datetime.datetime,
+    *,
+    ignore_ttl: bool = False,
+    allow_stale_calendar_day: bool = False,
 ) -> Optional[DailyArchive]:
-    """Returns the persisted daily result if it is still within
-    DAILY_ARCHIVE_TTL_HOURS, else None. `ignore_ttl=True` is used only for
-    the "a refresh is already in progress -- fall back to whatever we
-    have" path, so a user still gets something useful instead of a bare
-    "please wait"."""
+    """Returns the persisted daily result, or None if it must not be
+    reused. Two independent freshness gates, both logged with the exact
+    reason and the dates compared, since either one alone previously let
+    a previous day's archive leak into a new day (2026-07-15 fix -- see
+    module docstring below):
+
+    1. `ignore_ttl=False` (default): the payload must be at most
+       DAILY_ARCHIVE_TTL_HOURS old (rolling hours, existing behaviour).
+       `ignore_ttl=True` is used only for the "a refresh is already in
+       progress -- fall back to whatever we have" and "verify the write
+       just landed on disk" paths.
+    2. Calendar-day gate (always enforced unless `allow_stale_calendar_day
+       =True`): the archive's `generated_at`, converted to Yekaterinburg
+       local time, must fall on the SAME calendar date as `now` converted
+       the same way. A rolling 24h TTL alone is not enough -- an archive
+       generated at 23:50 Yekaterinburg time yesterday is only 20 minutes
+       "old" at 00:10 today, well inside a 24h TTL, but it describes
+       yesterday's matches and must never be served as today's result.
+       `allow_stale_calendar_day=True` is used only by /status, which
+       intentionally reports on a possibly-stale archive for diagnostics
+       and never presents it as fresh predictions."""
     ttl = 24.0 * 365 if ignore_ttl else DAILY_ARCHIVE_TTL_HOURS
     payload = football_cache.get(DAILY_ARCHIVE_KEY, ttl_hours=ttl)
+    now_date = local_date_str(now)
     if payload is None:
+        logger.info(
+            "daily_archive.rejected reason=no_payload_or_ttl_expired ttl_hours=%s now_local_date=%s "
+            "site=football_pipeline.load_daily_archive",
+            ttl, now_date,
+        )
         return None
     try:
         generated_at = datetime.datetime.fromisoformat(payload["generated_at"])
     except (KeyError, ValueError):
+        logger.warning(
+            "daily_archive.rejected reason=unparsable_generated_at now_local_date=%s "
+            "site=football_pipeline.load_daily_archive raw=%r",
+            now_date, payload.get("generated_at"),
+        )
         return None
-    return DailyArchive(messages=payload["messages"], diagnostics=payload.get("diagnostics", {}), generated_at=generated_at)
+
+    archive_date = local_date_str(generated_at)
+    same_day = is_same_local_day(generated_at, now)
+    if not same_day and not allow_stale_calendar_day:
+        logger.info(
+            "daily_archive.rejected reason=different_calendar_day archive_local_date=%s now_local_date=%s "
+            "generated_at_utc=%s ignore_ttl=%s site=football_pipeline.load_daily_archive",
+            archive_date, now_date, generated_at.isoformat(), ignore_ttl,
+        )
+        return None
+
+    logger.info(
+        "daily_archive.accepted reason=%s archive_local_date=%s now_local_date=%s generated_at_utc=%s "
+        "ignore_ttl=%s site=football_pipeline.load_daily_archive",
+        "same_calendar_day" if same_day else "stale_calendar_day_explicitly_allowed",
+        archive_date, now_date, generated_at.isoformat(), ignore_ttl,
+    )
+    return DailyArchive(
+        messages=payload["messages"],
+        diagnostics=payload.get("diagnostics", {}),
+        generated_at=generated_at,
+        is_stale_calendar_day=not same_day,
+    )
 
 
 def save_daily_archive(football_cache: FootballCache, result: "FootballPipelineResult", now: datetime.datetime) -> None:
@@ -126,6 +184,11 @@ def save_daily_archive(football_cache: FootballCache, result: "FootballPipelineR
         "errors": result.errors,
         "source": "новый запрос",
     }
+    logger.info(
+        "daily_archive.saved now_local_date=%s generated_at_utc=%s recommendations_count=%s "
+        "site=football_pipeline.save_daily_archive",
+        local_date_str(now), now.isoformat(), result.recommendations_count,
+    )
     football_cache.set(DAILY_ARCHIVE_KEY, {
         "messages": result.telegram_messages,
         "diagnostics": diagnostics,

@@ -79,6 +79,21 @@ def format_card_time(dt: datetime.datetime) -> str:
     return local.strftime("%d.%m.%Y в %H:%M")
 
 
+def is_same_local_day(dt_a: datetime.datetime, dt_b: datetime.datetime) -> bool:
+    """True only if both timestamps fall on the same Yekaterinburg
+    calendar date. This is the one place that must decide "is this still
+    today" for anything day-scoped (the daily archive, in particular) --
+    comparing raw UTC timestamps or elapsed hours is not equivalent,
+    since a UTC day and a Yekaterinburg day do not align (UTC+5)."""
+    return to_display_timezone(dt_a).date() == to_display_timezone(dt_b).date()
+
+
+def local_date_str(dt: datetime.datetime) -> str:
+    """ISO calendar date (YYYY-MM-DD) in Yekaterinburg local time -- used
+    for logging/diagnostics so a date comparison is unambiguous."""
+    return to_display_timezone(dt).date().isoformat()
+
+
 def format_user_time(dt: datetime.datetime, now: Optional[datetime.datetime] = None) -> str:
     """The one timestamp formatter for anything a user reads (reports,
     status, "updated at" lines): always Yekaterinburg local time, never
