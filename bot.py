@@ -37,14 +37,20 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 from ai_predictions.football_cache import FootballCache
 from ai_predictions.football_pipeline import (
     DailyArchive,
+    archive_empty_reason,
+    is_archive_valid,
     is_refresh_in_progress,
     load_daily_archive,
+    load_last_successful_archive,
     mark_refresh_in_progress,
     reselect_from_archive,
     run_football_predictions,
     save_daily_archive,
 )
-from ai_predictions.prediction_report import render_nothing_left_for_user_message
+from ai_predictions.prediction_report import (
+    render_nothing_left_for_user_message,
+    render_pool_empty_message,
+)
 from ai_predictions.value_config import DAILY_ARCHIVE_TTL_HOURS, LIVE_CACHE_TTL_MINUTES, MIN_LEAD_TIME_MINUTES
 from ai_predictions.window import format_user_time, local_date_str
 
@@ -459,6 +465,46 @@ async def _reply_from_pool(
     }
 
 
+async def _reply_empty_pool(
+    query,
+    empty_archive: DailyArchive,
+    now_dt: datetime,
+    football_cache,
+    telegram_user_id: Optional[int],
+) -> dict:
+    """Called when today's archive exists but its pool is empty (e.g.
+    Odds API quota exhausted). Tries to serve the last successful non-empty
+    archive as a fallback; if that also has nothing left, shows an honest
+    reason message.  NEVER says 'варианты уже показаны или начались'."""
+    reason = archive_empty_reason(empty_archive.diagnostics)
+
+    # Try the cross-day backup first.
+    fallback = load_last_successful_archive(football_cache, now_dt)
+    if is_archive_valid(fallback):
+        # Check whether any fallback picks are actually still bookable.
+        from ai_predictions.prediction_selector import has_enough_lead_time
+        bookable = [
+            e for e in fallback.pool
+            if has_enough_lead_time(e[0].candidate.fixture.kickoff_utc, now_dt)
+        ]
+        if bookable:
+            await query.message.reply_text(
+                f"⚠️ Сегодняшний пул не сформирован ({reason}).\n"
+                "Показываю доступные варианты из последнего успешного архива:",
+                reply_markup=main_keyboard(),
+            )
+            return await _reply_from_pool(
+                query, fallback, now_dt, football_cache, telegram_user_id, stale=True,
+            )
+
+    # Nothing usable at all -- honest message without blame on user.
+    await query.message.reply_text(
+        render_pool_empty_message(reason),
+        reply_markup=main_keyboard(),
+    )
+    return {**empty_archive.diagnostics, "recommendations_count": 0, "source": "архив (пустой)"}
+
+
 async def handle_ai_predictions(query, *, force_refresh: bool = False) -> None:
     """Strict daily archive: the first successful run of the (rolling)
     24h window computes and persists the FULL real, odds-backed candidate
@@ -468,7 +514,14 @@ async def handle_ai_predictions(query, *, force_refresh: bool = False) -> None:
     (never calling API-Football/The Odds API again), so matches that have
     already kicked off are dropped and, if any real candidates remain,
     fresh ones automatically take their place. `force_refresh=True` is
-    only ever passed from the admin-confirmed /refresh_data flow."""
+    only ever passed from the admin-confirmed /refresh_data flow.
+
+    Empty-pool handling (2026-07-16 change): an archive that exists but
+    has pool=[] is NOT treated as valid -- `is_archive_valid` gates every
+    path.  When today's archive is empty (e.g. Odds API quota exhausted),
+    the fallback tries `load_last_successful_archive` (cross-day backup of
+    the last non-empty pool) before showing the honest reason message.
+    Never shows "варианты уже показаны или начались" for an empty pool."""
     global ai_predictions_cache, ai_predictions_last_diagnostics, ai_predictions_last_success_ts
 
     # API-Football is the only REQUIRED key -- The Odds API is optional
@@ -487,17 +540,27 @@ async def handle_ai_predictions(query, *, force_refresh: bool = False) -> None:
     try:
         if not force_refresh:
             archive = load_daily_archive(football_cache, now_dt)
-            if archive is not None:
+            if is_archive_valid(archive):
                 ai_predictions_cache = {"archive": archive}
                 ai_predictions_last_diagnostics = await _reply_from_pool(
+                    query, archive, now_dt, football_cache, telegram_user_id,
+                )
+                return
+            if archive is not None:
+                # Today's archive exists but its pool is empty -- don't
+                # re-run the pipeline (quota is still zero), go straight
+                # to the honest empty-pool message / fallback path.
+                ai_predictions_last_diagnostics = await _reply_empty_pool(
                     query, archive, now_dt, football_cache, telegram_user_id,
                 )
                 return
 
         if ai_predictions_lock.locked() or is_refresh_in_progress(football_cache, now_dt):
             stale = load_daily_archive(football_cache, now_dt, ignore_ttl=True)
-            if stale is not None:
+            if is_archive_valid(stale):
                 await _reply_from_pool(query, stale, now_dt, football_cache, telegram_user_id, stale=True)
+            elif stale is not None:
+                await _reply_empty_pool(query, stale, now_dt, football_cache, telegram_user_id)
             else:
                 await query.message.reply_text(
                     "⏳ Архив данных уже формируется. Подожди немного и нажми кнопку снова.",
@@ -510,9 +573,14 @@ async def handle_ai_predictions(query, *, force_refresh: bool = False) -> None:
             # this same process just finished filling the archive.
             if not force_refresh:
                 archive = load_daily_archive(football_cache, now_dt)
-                if archive is not None:
+                if is_archive_valid(archive):
                     ai_predictions_cache = {"archive": archive}
                     ai_predictions_last_diagnostics = await _reply_from_pool(
+                        query, archive, now_dt, football_cache, telegram_user_id,
+                    )
+                    return
+                if archive is not None:
+                    ai_predictions_last_diagnostics = await _reply_empty_pool(
                         query, archive, now_dt, football_cache, telegram_user_id,
                     )
                     return
@@ -529,7 +597,6 @@ async def handle_ai_predictions(query, *, force_refresh: bool = False) -> None:
                     run_football_predictions,
                     football_cache=football_cache, now=now_dt, telegram_user_id=telegram_user_id,
                 )
-                messages = result.telegram_messages or ["На ближайшие 36 часов подходящих сигналов не найдено."]
                 save_daily_archive(football_cache, result, now_dt)
 
                 # Requirement: never report success unless the archive is
@@ -542,15 +609,8 @@ async def handle_ai_predictions(query, *, force_refresh: bool = False) -> None:
                     verified_archive = load_daily_archive(verify_cache, now_dt, ignore_ttl=True)
                 finally:
                     verify_cache.close()
-                if verified_archive is None:
-                    raise RuntimeError(
-                        "Суточный архив не подтверждён в SQLite после записи -- запись не выполнена."
-                    )
-                archive = verified_archive
 
-                ai_predictions_cache = {"archive": archive}
-                # Full technical diagnostics are kept only for /status --
-                # never sent here.
+                # Full technical diagnostics kept only for /status.
                 ai_predictions_last_diagnostics = {
                     "found_fixtures": result.found_fixtures,
                     "matched_fixtures": result.matched_fixtures,
@@ -569,9 +629,20 @@ async def handle_ai_predictions(query, *, force_refresh: bool = False) -> None:
                     "errors": result.errors,
                     "source": "новый запрос",
                 }
-                ai_predictions_last_success_ts = now_dt.timestamp()
-                for message in messages:
-                    await query.message.reply_text(message, reply_markup=main_keyboard())
+
+                if is_archive_valid(verified_archive):
+                    archive = verified_archive
+                    ai_predictions_cache = {"archive": archive}
+                    ai_predictions_last_success_ts = now_dt.timestamp()
+                    for message in result.telegram_messages or ["На ближайшие 36 часов подходящих сигналов не найдено."]:
+                        await query.message.reply_text(message, reply_markup=main_keyboard())
+                elif verified_archive is not None:
+                    # Saved but pool is empty (quota exhausted during run).
+                    await _reply_empty_pool(query, verified_archive, now_dt, football_cache, telegram_user_id)
+                else:
+                    raise RuntimeError(
+                        "Суточный архив не подтверждён в SQLite после записи -- запись не выполнена."
+                    )
             except Exception as e:
                 await query.message.reply_text(f"❌ Ошибка при формировании прогнозов ИИ: {e}", reply_markup=main_keyboard())
     finally:
@@ -698,6 +769,7 @@ def build_status_text(telegram_user_id: Optional[int] = None) -> str:
     shown_count: Optional[int] = None
     available_for_user: Optional[int] = None
     archive_state_text = "отсутствует"
+    archive_diagnostics: dict = {}   # raw diagnostics dict for archive_empty_reason()
     last_update_text = "ещё не было успешных обновлений"
     next_update_text = "неизвестно"
     source_text = "нет данных"
@@ -717,6 +789,8 @@ def build_status_text(telegram_user_id: Optional[int] = None) -> str:
             )
 
             if archive is not None:
+                archive_diagnostics = archive.diagnostics
+
                 # Pool counts: how many entries are still bookable vs. kicked off.
                 for rec, _, _ in archive.pool:
                     if rec.candidate.fixture.kickoff_utc > now_dt + timedelta(minutes=MIN_LEAD_TIME_MINUTES):
@@ -726,7 +800,7 @@ def build_status_text(telegram_user_id: Optional[int] = None) -> str:
                 pool_total = pool_available + pool_started
 
                 # Per-user counts (only when the caller supplies a Telegram id).
-                if telegram_user_id is not None:
+                if telegram_user_id is not None and pool_total > 0:
                     shown_keys = football_cache.get_shown_keys(
                         local_date_str(now_dt), telegram_user_id,
                     )
@@ -737,32 +811,28 @@ def build_status_text(telegram_user_id: Optional[int] = None) -> str:
                         and (rec.candidate.fixture.fixture_id, rec.candidate.market_key) not in shown_keys
                     )
 
-                # Freshness label.
-                is_fresh = (
-                    not archive.is_stale_calendar_day
-                    and (now_dt - archive.generated_at) <= timedelta(hours=DAILY_ARCHIVE_TTL_HOURS)
-                )
+                # Freshness / state label -- separate meaning for empty vs. non-empty pools.
+                is_today = not archive.is_stale_calendar_day
+                is_within_ttl = (now_dt - archive.generated_at) <= timedelta(hours=DAILY_ARCHIVE_TTL_HOURS)
+                is_fresh = is_today and is_within_ttl
                 if archive.is_stale_calendar_day:
-                    archive_state_text = "устарел (другой день в Екатеринбурге), будет пересобран при следующем запросе"
+                    archive_state_text = "другой день"
                 elif is_fresh:
-                    archive_state_text = "актуален"
+                    archive_state_text = "сегодня"
                 else:
-                    archive_state_text = "устарел (>24ч), будет обновлён при следующем запросе"
+                    archive_state_text = "устарел (>24ч)"
 
                 last_update_text = format_user_time(archive.generated_at, now_dt)
                 next_update_text = format_user_time(
                     archive.generated_at + timedelta(hours=DAILY_ARCHIVE_TTL_HOURS), now_dt,
                 )
 
-                # Source fix (requirement 3): archive.diagnostics["source"] is
-                # always "новый запрос" (set at save time); the authoritative
-                # "last response source" is in ai_predictions_last_diagnostics.
-                # After a process restart that source in memory, infer from
-                # whether a fresh valid archive exists (→ next response will
-                # come from archive).
+                # Source fix: archive.diagnostics["source"] is always
+                # "новый запрос" (set at save time); the authoritative last
+                # response source is in ai_predictions_last_diagnostics.
                 if ai_predictions_last_diagnostics and "source" in ai_predictions_last_diagnostics:
                     raw_source = ai_predictions_last_diagnostics["source"]
-                elif is_fresh:
+                elif is_fresh and pool_total > 0:
                     raw_source = "архив"
                 else:
                     raw_source = archive.diagnostics.get("source", "")
@@ -800,18 +870,27 @@ def build_status_text(telegram_user_id: Optional[int] = None) -> str:
     # ── 📦 Daily pool ────────────────────────────────────────────────────
     lines.append("📦 Дневной пул прогнозов:")
     if pool_total > 0:
+        # Valid pool: show counts.
+        lines.append(f"  Состояние: сформирован ({archive_state_text})")
         lines.append(f"  Всего найдено: {pool_total}")
         lines.append(f"  Доступны сейчас: {pool_available}")
         lines.append(f"  Уже начались / слишком близко: {pool_started}")
         if shown_count is not None:
             lines.append(f"  Показано вам сегодня: {shown_count}")
             lines.append(f"  Ещё доступно для вас: {available_for_user}")
+        lines.append(f"  Источник прогнозов: {source_text}")
+    elif archive_state_text != "отсутствует":
+        # Archive exists but pool is empty -- show reason, NOT "актуален".
+        empty_reason = archive_empty_reason(archive_diagnostics)
+        lines.append(f"  Состояние: не сформирован")
+        lines.append(f"  Размер пула: 0")
+        lines.append(f"  Причина: {empty_reason}")
+        lines.append(f"  Источник прогнозов: отсутствует")
     else:
-        lines.append("  Пул не сформирован")
-    lines.append(f"  Состояние: {archive_state_text}")
+        lines.append(f"  Состояние: {archive_state_text}")
+        lines.append(f"  Источник прогнозов: {source_text}")
     lines.append(f"  Последнее обновление: {last_update_text}")
     lines.append(f"  Следующее обновление: {next_update_text}")
-    lines.append(f"  Источник прогнозов: {source_text}")
     lines.append(f"  Последний запрос к Odds API: {odds_api_last_request_text}")
     lines.append(f"  Остаток кредитов Odds API: {odds_api_credits_remaining_text}")
     if archive_error_notes:

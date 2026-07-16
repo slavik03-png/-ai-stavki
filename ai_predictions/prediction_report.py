@@ -71,6 +71,16 @@ NOTHING_LEFT_FOR_USER_TEMPLATE = (
     "Новый пул будет сформирован после следующего суточного обновления."
 )
 
+#: Shown when today's pipeline run produced a pool with zero real
+#: odds-backed recommendations -- a structurally different situation from
+#: NOTHING_LEFT_FOR_USER (which requires that picks WERE available and
+#: have since been shown/started).  Never says "варианты показаны или
+#: начались" because no picks ever existed in this pool.
+POOL_EMPTY_TEMPLATE = (
+    "Сегодняшний пул прогнозов не сформирован: {reason}.\n"
+    "Новые прогнозы появятся после следующего обновления квоты или источника данных."
+)
+
 #: Shown once, after all cards, whenever at least one recommendation was
 #: produced -- never mixed into an individual card.
 DISCLAIMER = (
@@ -93,6 +103,14 @@ def render_no_odds_events_message(found_fixtures: int) -> str:
 
 def render_nothing_left_for_user_message() -> str:
     return NOTHING_LEFT_FOR_USER_TEMPLATE
+
+
+def render_pool_empty_message(reason: str) -> str:
+    """Shown when today's pipeline ran but produced ZERO real picks --
+    structurally different from `render_nothing_left_for_user_message`
+    (which requires that picks existed and have since been shown/started).
+    Never implies any pick was ever shown or that a match began."""
+    return POOL_EMPTY_TEMPLATE.format(reason=reason)
 
 
 def _format_probability(probability: float) -> str:

@@ -59,6 +59,7 @@ from ai_predictions.odds_client import QUOTA_EXHAUSTED_MARKER, fetch_all_active_
 from ai_predictions.odds_lookup import OddsLookupResult, attach_prices_from_matches
 from ai_predictions.prediction_report import (
     render_nothing_left_for_user_message,
+    render_pool_empty_message,
     render_predictions_message,
 )
 from ai_predictions.prediction_selector import (
@@ -104,6 +105,21 @@ DAILY_ARCHIVE_KEY = "daily_archive:predictions_top5_window36h"
 #: from the archive key itself so a crashed/slow run never looks like a
 #: successful archive.
 DAILY_ARCHIVE_LOCK_KEY = "daily_archive:refresh_in_progress"
+
+#: Persistent backup of the last archive whose pool contained at least one
+#: real odds-backed recommendation.  Never overwritten with an empty pool,
+#: never calendar-day-gated -- it survives across midnight and process
+#: restarts so that a day when Odds API quota is exhausted can still fall
+#: back to yesterday's (or earlier) real picks whose matches haven't yet
+#: kicked off.
+LAST_SUCCESSFUL_ARCHIVE_KEY = "daily_archive:last_successful_nonempty_v1"
+
+#: Stores the most-recently-seen Odds API credits-remaining header so the
+#: next pipeline run can skip the live call when the quota is already known
+#: to be zero.  TTL is 26 h (a deliberate margin over 24 h to survive the
+#: odds-provider's own daily reset without a gap).
+ODDS_CREDITS_CACHE_KEY = "odds_api:credits_remaining_v1"
+ODDS_CREDITS_CACHE_TTL_HOURS = 26
 
 
 @dataclass
@@ -224,6 +240,77 @@ def _deserialize_pool_entry(data: Dict[str, Any]) -> PoolEntry:
     )
     rec = RankedRecommendation(candidate=candidate, signal_level=data["signal_level"])
     return rec, data["odds"], data["bookmaker"]
+
+
+def is_archive_valid(archive: Optional["DailyArchive"]) -> bool:
+    """An archive is VALID (has real predictions to offer) only when it
+    is present AND its pool has at least one real odds-backed entry.
+
+    An empty pool -- produced when Odds API quota is exhausted, no
+    fixtures were found, or every candidate lacked a real bookmaker price
+    -- must NOT be treated as a valid archive.  Callers that previously
+    checked `archive is not None` would silently fall through to
+    `render_nothing_left_for_user_message`, which misleadingly implies
+    picks existed and were shown/started when none ever existed."""
+    return archive is not None and len(archive.pool) > 0
+
+
+def archive_empty_reason(diagnostics: Dict[str, Any]) -> str:
+    """Human-readable Russian reason why the pool is empty, inferred from
+    the diagnostics saved alongside the (empty) archive.  Used by bot.py
+    to build an honest user-facing message and by /status."""
+    odds_status = diagnostics.get("odds_status", "unavailable")
+    if odds_status == "quota_exhausted":
+        return "исчерпан лимит The Odds API"
+    errors = diagnostics.get("errors", [])
+    for err in errors:
+        low = err.lower()
+        if "лимит" in low and "api-football" in low:
+            return "исчерпан лимит API-Football"
+        if "quota" in low or "исчерпан" in low:
+            return "исчерпан лимит источника данных"
+    if diagnostics.get("found_fixtures", 0) == 0:
+        return "не найдено матчей в анализируемом окне"
+    if diagnostics.get("matched_fixtures", 0) == 0:
+        return "ни один матч не сопоставлен с реальными коэффициентами"
+    if errors:
+        return "ошибка источника данных"
+    return "не найдено вариантов с достаточной уверенностью"
+
+
+def load_last_successful_archive(
+    football_cache: FootballCache,
+    now: datetime.datetime,
+) -> Optional["DailyArchive"]:
+    """Returns the most-recent archive whose pool was non-empty, regardless
+    of age or calendar day.  Used as a fallback when today's pipeline run
+    produced an empty pool: if yesterday's (or an earlier day's) picks
+    haven't all kicked off yet, we can still serve them rather than telling
+    the user there is nothing at all.
+
+    The returned archive will always have `is_stale_calendar_day=True`
+    (since it is by definition not today's run), so bot.py can label it
+    clearly as a fallback."""
+    payload = football_cache.get(LAST_SUCCESSFUL_ARCHIVE_KEY, ttl_hours=365 * 24)
+    if payload is None:
+        return None
+    try:
+        generated_at = datetime.datetime.fromisoformat(payload["generated_at"])
+    except (KeyError, ValueError):
+        return None
+    raw_pool = payload.get("pool", [])
+    try:
+        pool = [_deserialize_pool_entry(entry) for entry in raw_pool]
+    except (KeyError, ValueError, TypeError):
+        pool = []
+    if not pool:
+        return None
+    return DailyArchive(
+        pool=pool,
+        diagnostics=payload.get("diagnostics", {}),
+        generated_at=generated_at,
+        is_stale_calendar_day=True,  # always true: this is a cross-day backup
+    )
 
 
 def select_and_render(
@@ -481,6 +568,22 @@ def load_daily_archive(
 
 
 def save_daily_archive(football_cache: FootballCache, result: "FootballPipelineResult", now: datetime.datetime) -> None:
+    pool_is_nonempty = len(result.pool) > 0
+
+    # Never overwrite an existing non-empty today-archive with an empty
+    # result (e.g. when the Odds API quota was exhausted during a forced
+    # refresh).  The empty diagnostics are still useful for /status, but
+    # they must not destroy the real predictions that exist for today.
+    if not pool_is_nonempty:
+        existing = load_daily_archive(football_cache, now, ignore_ttl=True)
+        if is_archive_valid(existing):
+            logger.info(
+                "daily_archive.save_skipped reason=empty_pool_would_overwrite_valid_archive "
+                "now_local_date=%s existing_pool_size=%s site=football_pipeline.save_daily_archive",
+                local_date_str(now), len(existing.pool),
+            )
+            return
+
     diagnostics = {
         "found_fixtures": result.found_fixtures,
         "matched_fixtures": result.matched_fixtures,
@@ -499,16 +602,29 @@ def save_daily_archive(football_cache: FootballCache, result: "FootballPipelineR
         "errors": result.errors,
         "source": "новый запрос",
     }
+    serialized_pool = [_serialize_pool_entry(entry) for entry in result.pool]
+    payload = {
+        "pool": serialized_pool,
+        "diagnostics": diagnostics,
+        "generated_at": now.isoformat(),
+    }
     logger.info(
         "daily_archive.saved now_local_date=%s generated_at_utc=%s recommendations_count=%s pool_size=%s "
         "site=football_pipeline.save_daily_archive",
         local_date_str(now), now.isoformat(), result.recommendations_count, len(result.pool),
     )
-    football_cache.set(DAILY_ARCHIVE_KEY, {
-        "pool": [_serialize_pool_entry(entry) for entry in result.pool],
-        "diagnostics": diagnostics,
-        "generated_at": now.isoformat(),
-    })
+    football_cache.set(DAILY_ARCHIVE_KEY, payload)
+
+    # Preserve a cross-day backup of the last run that actually produced
+    # real picks.  Never overwritten with an empty pool, never expires
+    # within 1 year (load_last_successful_archive handles its own TTL).
+    if pool_is_nonempty:
+        football_cache.set(LAST_SUCCESSFUL_ARCHIVE_KEY, payload)
+        logger.info(
+            "daily_archive.last_successful_saved now_local_date=%s pool_size=%s "
+            "site=football_pipeline.save_daily_archive",
+            local_date_str(now), len(result.pool),
+        )
 
 
 def mark_refresh_in_progress(football_cache: FootballCache, now: datetime.datetime) -> None:
@@ -611,20 +727,45 @@ def run_football_predictions(
         odds_fetch_errors = ["Не найден ODDS_API_KEY"]
         odds_events = []
     else:
-        try:
-            odds_fetch = fetch_all_active_football_events(api_key=odds_api_key, persistent_cache=football_cache)
-            odds_fetch_errors = odds_fetch.errors
-            odds_events = odds_fetch.events
-            # This call is the ONLY place the whole pipeline spends real
-            # Odds API quota (see module docstring + odds-first gating
-            # memory) -- record exactly how much was spent and when, so
-            # /status can show real numbers instead of a vague tri-state.
-            result.odds_api_sports_queried = len(odds_fetch.sports_queried)
-            result.odds_api_credits_remaining = odds_fetch.credits_remaining
-            result.odds_api_last_request_at = now.isoformat()
-        except Exception as exc:  # never let odds discovery crash the run
-            odds_fetch_errors = [str(exc)]
+        # Quota guard: if the last known credits value is "0" we know the
+        # Odds API will reject any new request until its daily counter
+        # resets.  Skip the live call entirely rather than spending a
+        # request (and potentially getting throttled) to hear the same
+        # answer we already have cached.
+        cached_credits = football_cache.get(ODDS_CREDITS_CACHE_KEY, ttl_hours=ODDS_CREDITS_CACHE_TTL_HOURS)
+        if cached_credits is not None and cached_credits.get("remaining") == "0":
+            logger.info(
+                "odds_api.skipped reason=quota_known_zero cached_remaining=0 "
+                "site=football_pipeline.run_football_predictions"
+            )
+            odds_fetch_errors = [
+                f"{QUOTA_EXHAUSTED_MARKER}: квота The Odds API уже исчерпана "
+                f"(остаток 0 по последнему ответу API, повторный запрос пропущен)"
+            ]
             odds_events = []
+            result.odds_api_credits_remaining = "0"
+        else:
+            try:
+                odds_fetch = fetch_all_active_football_events(api_key=odds_api_key, persistent_cache=football_cache)
+                odds_fetch_errors = odds_fetch.errors
+                odds_events = odds_fetch.events
+                # This call is the ONLY place the whole pipeline spends real
+                # Odds API quota (see module docstring + odds-first gating
+                # memory) -- record exactly how much was spent and when, so
+                # /status can show real numbers instead of a vague tri-state.
+                result.odds_api_sports_queried = len(odds_fetch.sports_queried)
+                result.odds_api_credits_remaining = odds_fetch.credits_remaining
+                result.odds_api_last_request_at = now.isoformat()
+                # Persist the latest credits count so the NEXT run can
+                # short-circuit without spending quota (see above).
+                if odds_fetch.credits_remaining is not None:
+                    football_cache.set(
+                        ODDS_CREDITS_CACHE_KEY,
+                        {"remaining": odds_fetch.credits_remaining},
+                    )
+            except Exception as exc:  # never let odds discovery crash the run
+                odds_fetch_errors = [str(exc)]
+                odds_events = []
 
     if any(QUOTA_EXHAUSTED_MARKER in e for e in odds_fetch_errors):
         result.odds_status = "quota_exhausted"
