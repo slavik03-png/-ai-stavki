@@ -1092,11 +1092,15 @@ def run_health_server() -> None:
     logging.info("Health server started on port %s", port)
     server.serve_forever()
 
+
 def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("Нет переменной TELEGRAM_BOT_TOKEN")
 
-   threading.Thread(target=run_health_server, daemon=True).start()
+    threading.Thread(
+        target=run_health_server,
+        daemon=True,
+    ).start()
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -1106,7 +1110,8 @@ def main() -> None:
     app.add_handler(CommandHandler("admin_report", admin_report_command))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.post_init = _post_init
-    print("AI Ставки Bot запущен")
+
+    print("AI Ставки Бот запущен")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
