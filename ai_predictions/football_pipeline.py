@@ -118,7 +118,7 @@ LAST_SUCCESSFUL_ARCHIVE_KEY = "daily_archive:last_successful_nonempty_v1"
 #: next pipeline run can skip the live call when the quota is already known
 #: to be zero.  TTL is 26 h (a deliberate margin over 24 h to survive the
 #: odds-provider's own daily reset without a gap).
-ODDS_CREDITS_CACHE_KEY = "odds_api:credits_remaining_v1"
+ODDS_CREDITS_CACHE_KEY = "odds_api:credits_remaining_v2"
 ODDS_CREDITS_CACHE_TTL_HOURS = 26
 
 
