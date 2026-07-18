@@ -7,6 +7,8 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 
 import requests
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # INFO-level logging is required so the daily-archive freshness decisions
 # logged by ai_predictions/football_pipeline.py (which calendar day the
