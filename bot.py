@@ -1075,10 +1075,29 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             except Exception as e:
                 await query.message.reply_text(f"❌ Ошибка: {e}", reply_markup=main_keyboard())
 
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"AI Stavki Bot is running")
+
+    def log_message(self, format, *args):
+        return
+
+
+def run_health_server() -> None:
+    port = int(os.getenv("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    logging.info("Health server started on port %s", port)
+    server.serve_forever()
 
 def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("Нет переменной TELEGRAM_BOT_TOKEN")
+
+   threading.Thread(target=run_health_server, daemon=True).start()
+
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status_command))
