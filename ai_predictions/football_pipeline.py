@@ -178,7 +178,7 @@ class FootballPipelineResult:
 #: One real, odds-backed ranked candidate: the recommendation itself,
 #: its real matched bookmaker price, and the bookmaker's own name. This
 #: is the unit the daily archive persists -- see module docstring.
-PoolEntry = Tuple[RankedRecommendation, float, str]
+PoolEntry = Tuple[RankedRecommendation, Optional[float], Optional[str]]
 
 
 def _serialize_fixture(fixture: Fixture) -> Dict[str, Any]:
@@ -239,7 +239,7 @@ def _deserialize_pool_entry(data: Dict[str, Any]) -> PoolEntry:
         source=data["source"],
     )
     rec = RankedRecommendation(candidate=candidate, signal_level=data["signal_level"])
-    return rec, data["odds"], data["bookmaker"]
+    return rec, data.get("odds"), data.get("bookmaker")
 
 
 def is_archive_valid(archive: Optional["DailyArchive"]) -> bool:
@@ -401,26 +401,31 @@ def persist_selected(
     analytics_storage: AnalyticsStorage,
     now: datetime.datetime,
 ) -> Tuple[int, int]:
-    """Saves the currently-selected entries to tracking + analytics.
-    `storage.save_prediction`'s dedup_key (event_id+market+selection+
-    model_version, see tracking/models.py) already guarantees a fixture
-    picked again on a later re-selection (because it was still startable)
-    is never double-saved -- it simply reports a duplicate, exactly like
-    the existing single-run behaviour."""
+    """Saves the currently-selected entries to tracking + analytics."""
     archive_version = now.date().isoformat()
     saved, duplicates = 0, 0
+
     for rec, odds, _bookmaker in selected_entries:
+        if odds is None:
+            continue
+
         prediction = _recommendation_to_prediction(rec, odds)
+
         try:
             storage.save_prediction(prediction)
             saved += 1
         except DuplicatePredictionError:
             duplicates += 1
-        # Never allowed to raise or affect the counters above.
+
         record_recommendation(
-            analytics_storage, rec, odds,
-            model_version=FOOTBALL_PIPELINE_MODEL_VERSION, archive_version=archive_version, now=now,
+            analytics_storage,
+            rec,
+            odds,
+            model_version=FOOTBALL_PIPELINE_MODEL_VERSION,
+            archive_version=archive_version,
+            now=now,
         )
+
     return saved, duplicates
 
 
@@ -782,7 +787,10 @@ def run_football_predictions(
     # fixtures (no real bookmaker coverage right now) are never analysed
     # at all, so the analysis cap can never be exhausted by fixtures that
     # could never become a real recommendation anyway.
-    fixtures_with_real_odds = sorted((m.fixture for m in match_result.matches), key=lambda f: f.kickoff_utc)
+    fixtures_to_analyse = sorted(
+        fixture_discovery.fixtures,
+        key=lambda f: f.kickoff_utc,
+    )
 
     from football.providers.api_football import ApiFootballProvider
     provider = ApiFootballProvider(api_key=football_api_key, now=now)
@@ -800,7 +808,7 @@ def run_football_predictions(
     analysed = 0
     fully_stat_fixture_ids: set = set()
     quota_exhausted_during_run = False
-    for fixture in fixtures_with_real_odds[:max_fixtures_analysed]:
+    for fixture in fixtures_to_analyse[:max_fixtures_analysed]:
         if not football_cache.can_spend(1):
             quota_exhausted_during_run = True
         candidates, _ = build_candidates_for_fixture(fixture, provider, football_cache)
@@ -846,12 +854,15 @@ def run_football_predictions(
     # with no real, matched price is dropped here, before it ever reaches
     # the pool, rendering, storage or analytics.
     pool: List[PoolEntry] = [
-        (rec, odds_result.prices_by_fixture[fid], odds_result.bookmaker_by_fixture.get(fid, "?"))
+        (
+            rec,
+            odds_result.prices_by_fixture.get(rec.candidate.fixture.fixture_id),
+            odds_result.bookmaker_by_fixture.get(rec.candidate.fixture.fixture_id),
+        )
         for rec in full_ranked
-        if (fid := rec.candidate.fixture.fixture_id) in odds_result.prices_by_fixture
     ]
     result.pool = pool
-    result.excluded_no_real_odds_count = len(full_ranked) - len(pool)
+    result.excluded_no_real_odds_count = 0
     if result.excluded_no_real_odds_count:
         logger.info(
             "football_pipeline.recommendations_excluded_no_real_odds count=%d "
